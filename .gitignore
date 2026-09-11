@@ -1,0 +1,54 @@
+# dependencies
+node_modules/
+.pnp
+.pnp.js
+.yarn/install-state.gz
+
+# next.js
+.next/
+out/
+next-env.d.ts
+
+# build
+build/
+dist/
+*.tsbuildinfo
+
+# env / secrets
+.env
+.env.*
+!.env.example
+
+# local studio stores
+# file-repo persist (used when DATABASE_URL is unset)
+.data/
+# geodata download cache for scripts/build-basemap.mjs
+.cache/
+
+# local tooling
+.codegraph/
+
+# logs / debug
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# test / coverage
+coverage/
+
+# vercel / drizzle kit leftovers
+.vercel
+.drizzle/
+
+# OS
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# editors
+.idea/
+*.swp
+*.swo
+*~
