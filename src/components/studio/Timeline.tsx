@@ -1,269 +1,267 @@
 "use client";
+import React, { useEffect, useMemo, useRef, useState } from "react";
+import type { EventType, ProjectDoc, StudioEvent } from "@/lib/studio/types";
+import { EVENT_TYPE_LABELS, TRACK_ORDER } from "@/lib/studio/types";
+import { formatTime } from "@/lib/studio/state";
+import { Button, NumberInput } from "./ui";
 
-import { useEffect, useMemo, useRef } from "react";
-import { ChevronsLeft, ChevronsRight, Pause, Play, Repeat, SkipBack, StepBack, StepForward } from "lucide-react";
-import { useStudio } from "@/store/studio";
-import { dateAtTime, formatDate, formatElapsed, parseDate, timeAtDate } from "@/lib/time";
-import type { Selection } from "@/lib/types";
-import { Button } from "./ui";
-import { stepFrames } from "./actions";
+const TRACK_COLORS: Record<EventType, string> = {
+  year: "bg-amber-600/80 border-amber-400",
+  camera: "bg-sky-700/80 border-sky-400",
+  territory: "bg-rose-700/80 border-rose-400",
+  disintegrate: "bg-fuchsia-700/80 border-fuchsia-400",
+  nationChange: "bg-orange-700/80 border-orange-400",
+  marker: "bg-red-800/80 border-red-400",
+  text: "bg-teal-700/80 border-teal-400",
+  subtitle: "bg-emerald-700/80 border-emerald-400",
+  flags: "bg-indigo-700/80 border-indigo-400",
+  inset: "bg-cyan-800/80 border-cyan-400",
+};
 
-interface TrackItem {
-  sel: Selection;
-  name: string;
-  color: string;
-  keyframes: number[]; // times (s)
-  span?: [number, number]; // times (s)
+export interface TimelineProps {
+  project: ProjectDoc;
+  time: number;
+  playing: boolean;
+  selectedId: string | null;
+  onSelect: (id: string | null) => void;
+  onSeek: (t: number) => void;
+  onTogglePlay: () => void;
+  onUpdateEvent: (id: string, patch: Partial<StudioEvent>, record: boolean) => void;
+  onAdd: (type: EventType) => void;
+  onDuration: (d: number) => void;
+  onDeleteSelected: () => void;
+  onDuplicateSelected: () => void;
 }
 
-export default function Timeline() {
-  const project = useStudio((s) => s.project);
-  const time = useStudio((s) => s.time);
-  const playing = useStudio((s) => s.playing);
-  const loop = useStudio((s) => s.loop);
-  const rate = useStudio((s) => s.rate);
-  const selection = useStudio((s) => s.selection);
-  const setTime = useStudio((s) => s.setTime);
-  const setPlaying = useStudio((s) => s.setPlaying);
-  const setLoop = useStudio((s) => s.setLoop);
-  const setRate = useStudio((s) => s.setRate);
-  const select = useStudio((s) => s.select);
-  const rulerRef = useRef<HTMLDivElement>(null);
-  const scrubbing = useRef(false);
+function eventTitle(e: StudioEvent): string {
+  switch (e.type) {
+    case "year":
+      return e.text;
+    case "subtitle":
+      return e.text;
+    case "text":
+      return e.text;
+    case "territory":
+      return e.label ?? `→ ${e.toNation} (${e.regions.length})`;
+    case "disintegrate":
+      return e.label ?? `${e.from} splits ×${e.parts.length}`;
+    case "nationChange":
+      return e.label ?? `${e.nation}: ${e.name ?? e.color ?? "change"}`;
+    case "camera":
+      return e.label ?? `cam ${e.camera.lon.toFixed(0)},${e.camera.lat.toFixed(0)} ×${e.camera.scale.toFixed(0)}`;
+    case "marker":
+      return e.label ?? e.kind;
+    case "flags":
+      return e.label ?? `${e.left.length} vs ${e.right.length}`;
+    case "inset":
+      return e.label ?? e.title ?? "inset";
+  }
+}
 
-  const duration = project?.video.duration ?? 1;
+export default function Timeline(props: TimelineProps) {
+  const { project, time, playing, selectedId } = props;
+  const [pps, setPps] = useState(22);
+  const [snap, setSnap] = useState(true);
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const duration = project.duration;
+  const totalW = duration * pps + 160;
 
-  const ticks = useMemo(() => {
-    if (!project) return [] as { t: number; label: string; major: boolean }[];
-    const start = parseDate(project.time.start);
-    const end = parseDate(project.time.end);
-    const y0 = new Date(start).getUTCFullYear();
-    const y1 = new Date(end).getUTCFullYear();
-    const out: { t: number; label: string; major: boolean }[] = [];
-    const years = y1 - y0;
-    const monthStep = years <= 2 ? 1 : years <= 6 ? 3 : years <= 15 ? 6 : 0;
-    for (let y = y0; y <= y1 + 1; y++) {
-      for (let mo = 0; mo < 12; mo += monthStep || 12) {
-        const ms = Date.UTC(y, mo, 1);
-        if (ms < start || ms > end) continue;
-        const t = timeAtDate(project, ms);
-        out.push({ t, label: mo === 0 ? String(y) : new Date(ms).toLocaleString("en", { month: "short", timeZone: "UTC" }), major: mo === 0 });
-      }
-    }
-    return out;
-  }, [project]);
-
+  // lanes per track
   const tracks = useMemo(() => {
-    if (!project) return [] as { group: string; items: TrackItem[] }[];
-    const T = (d: string | undefined, fallback: number) => (d ? timeAtDate(project, parseDate(d)) : fallback);
-    const fcolor = (id: string) => project.factions.find((f) => f.id === id)?.color ?? "#888";
-    const groups: { group: string; items: TrackItem[] }[] = [];
-    groups.push({
-      group: "Camera",
-      items: [{ sel: { type: "camera", id: "0" }, name: "Camera", color: "#38bdf8", keyframes: project.camera.keyframes.map((k) => T(k.date, 0)) }],
+    return TRACK_ORDER.map((type) => {
+      const evs = project.events.filter((e) => e.type === type).sort((a, b) => a.start - b.start);
+      const laneEnds: number[] = [];
+      const placed = evs.map((e) => {
+        const minW = 0.35; // seconds of visual width
+        const s = e.start;
+        const en = Math.max(e.end, s + minW);
+        let lane = laneEnds.findIndex((end) => end <= s + 0.01);
+        if (lane === -1) {
+          lane = laneEnds.length;
+          laneEnds.push(en);
+        } else laneEnds[lane] = en;
+        return { e, lane };
+      });
+      return { type, events: placed, lanes: Math.max(1, laneEnds.length) };
     });
-    groups.push({
-      group: "Events",
-      items: [{ sel: { type: "event", id: "*" }, name: `Subtitles (${project.events.length})`, color: "#f472b6", keyframes: project.events.map((e) => T(e.date, 0)) }],
-    });
-    groups.push({
-      group: "Zones",
-      items: project.zones.map((z) => {
-        const kfs = z.keyframes.map((k) => T(k.date, 0)).sort((a, b) => a - b);
-        return { sel: { type: "zone", id: z.id }, name: z.name, color: fcolor(z.factionId), keyframes: kfs, span: [T(z.from, kfs[0] ?? 0), T(z.to, duration)] };
-      }),
-    });
-    groups.push({
-      group: "Front lines",
-      items: project.lines.map((l) => {
-        const kfs = l.keyframes.map((k) => T(k.date, 0)).sort((a, b) => a - b);
-        return { sel: { type: "line", id: l.id }, name: l.name, color: l.color, keyframes: kfs, span: [T(l.from, kfs[0] ?? 0), T(l.to, duration)] };
-      }),
-    });
-    groups.push({
-      group: "Arrows",
-      items: project.arrows.map((a) => ({ sel: { type: "arrow", id: a.id }, name: a.name, color: a.color, keyframes: [T(a.start, 0), T(a.end, 0)], span: [T(a.start, 0), T(a.holdUntil ?? a.end, duration)] })),
-    });
-    groups.push({
-      group: "Markers",
-      items: project.markers.map((m) => ({ sel: { type: "marker", id: m.id }, name: m.name, color: m.color, keyframes: [], span: [T(m.from, 0), T(m.to, duration)] })),
-    });
-    groups.push({
-      group: "Labels",
-      items: project.labels.map((l) => ({ sel: { type: "label", id: l.id }, name: l.text, color: "#e2e8f0", keyframes: (l.valueKeyframes ?? []).map((k) => T(k.date, 0)), span: [T(l.from, 0), T(l.to, duration)] })),
-    });
-    return groups.filter((g) => g.items.length);
-  }, [project, duration]);
+  }, [project.events]);
 
-  const pct = (t: number) => `${(Math.max(0, Math.min(duration, t)) / duration) * 100}%`;
+  // auto-scroll while playing
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (!el || !playing) return;
+    const x = time * pps;
+    if (x < el.scrollLeft + 40 || x > el.scrollLeft + el.clientWidth - 80) el.scrollLeft = Math.max(0, x - 120);
+  }, [time, playing, pps]);
 
-  const seekFromEvent = (e: MouseEvent | React.MouseEvent) => {
-    const el = rulerRef.current;
-    if (!el) return;
-    const rect = el.getBoundingClientRect();
-    const f = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
-    setTime(f * duration);
+  // ---------------------------------------------------------------- scrubbing
+  const scrubbing = useRef(false);
+  const xToTime = (clientX: number) => {
+    const el = scrollRef.current!;
+    const r = el.getBoundingClientRect();
+    const x = clientX - r.left + el.scrollLeft;
+    return Math.max(0, Math.min(duration, x / pps));
+  };
+  const onRulerDown = (e: React.PointerEvent) => {
+    scrubbing.current = true;
+    (e.target as HTMLElement).setPointerCapture(e.pointerId);
+    props.onSeek(xToTime(e.clientX));
+  };
+  const onRulerMove = (e: React.PointerEvent) => {
+    if (scrubbing.current) props.onSeek(xToTime(e.clientX));
+  };
+  const onRulerUp = () => {
+    scrubbing.current = false;
   };
 
-  useEffect(() => {
-    const move = (e: MouseEvent) => scrubbing.current && seekFromEvent(e);
-    const up = () => (scrubbing.current = false);
-    window.addEventListener("mousemove", move);
-    window.addEventListener("mouseup", up);
-    return () => {
-      window.removeEventListener("mousemove", move);
-      window.removeEventListener("mouseup", up);
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [duration]);
+  // ---------------------------------------------------------------- event drag
+  const dragRef = useRef<{ id: string; mode: "move" | "start" | "end"; x0: number; start: number; end: number } | null>(null);
+  const roundSnap = (v: number) => (snap ? Math.round(v * 4) / 4 : Math.round(v * 100) / 100);
+  const onEventDown = (e: React.PointerEvent, ev: StudioEvent) => {
+    e.stopPropagation();
+    props.onSelect(ev.id);
+    const target = e.currentTarget as HTMLElement;
+    const r = target.getBoundingClientRect();
+    const rel = e.clientX - r.left;
+    const mode: "move" | "start" | "end" = rel < 7 && r.width > 20 ? "start" : r.width - rel < 7 && r.width > 20 ? "end" : "move";
+    dragRef.current = { id: ev.id, mode, x0: e.clientX, start: ev.start, end: ev.end };
+    target.setPointerCapture(e.pointerId);
+  };
+  const onEventMove = (e: React.PointerEvent) => {
+    const d = dragRef.current;
+    if (!d) return;
+    const dt = (e.clientX - d.x0) / pps;
+    const dur = d.end - d.start;
+    if (d.mode === "move") {
+      const s = Math.max(0, Math.min(duration - dur, roundSnap(d.start + dt)));
+      props.onUpdateEvent(d.id, { start: s, end: s + dur }, false);
+    } else if (d.mode === "start") {
+      const s = Math.max(0, Math.min(d.end - 0.1, roundSnap(d.start + dt)));
+      props.onUpdateEvent(d.id, { start: s }, false);
+    } else {
+      const en = Math.max(d.start + 0.1, Math.min(duration, roundSnap(d.end + dt)));
+      props.onUpdateEvent(d.id, { end: en }, false);
+    }
+  };
+  const onEventUp = () => {
+    const d = dragRef.current;
+    dragRef.current = null;
+    if (!d) return;
+    const ev = project.events.find((x) => x.id === d.id);
+    if (ev) props.onUpdateEvent(d.id, { start: ev.start, end: ev.end }, true);
+  };
 
-  // auto-scroll selected track into view
-  const listRef = useRef<HTMLDivElement>(null);
-  useEffect(() => {
-    if (!selection || !listRef.current) return;
-    const el = listRef.current.querySelector<HTMLElement>(`[data-track="${selection.type}:${selection.id}"]`);
-    el?.scrollIntoView({ block: "nearest" });
-  }, [selection]);
-
-  if (!project) return null;
-  const dateMs = dateAtTime(project, time);
+  // ruler ticks
+  const major = pps >= 40 ? 1 : pps >= 15 ? 5 : 10;
+  const ticks: number[] = [];
+  for (let t = 0; t <= duration; t += major) ticks.push(t);
 
   return (
-    <div className="flex h-full flex-col border-t border-slate-800 bg-slate-900 text-slate-200">
-      <div className="flex items-center gap-2 border-b border-slate-800 px-2 py-1">
-        <Button variant="ghost" title="Go to start" onClick={() => setTime(0)}>
-          <SkipBack size={14} />
+    <div className="flex h-full flex-col border-t border-zinc-800 bg-zinc-950 text-zinc-200">
+      {/* transport */}
+      <div className="flex items-center gap-2 border-b border-zinc-800 px-2 py-1">
+        <Button onClick={() => props.onSeek(0)} title="Go to start">
+          ⏮
         </Button>
-        <Button variant="ghost" title="Back 10 frames" onClick={() => stepFrames(-10)}>
-          <ChevronsLeft size={14} />
+        <Button onClick={props.onTogglePlay} variant="primary" title="Play / pause (Space)" className="w-16">
+          {playing ? "❚❚ Pause" : "▶ Play"}
         </Button>
-        <Button variant="ghost" title="Previous frame (←)" onClick={() => stepFrames(-1)}>
-          <StepBack size={14} />
-        </Button>
-        <Button variant="primary" title="Play / pause (Space)" onClick={() => setPlaying(!playing)} className="w-16">
-          {playing ? <Pause size={14} /> : <Play size={14} />}
-        </Button>
-        <Button variant="ghost" title="Next frame (→)" onClick={() => stepFrames(1)}>
-          <StepForward size={14} />
-        </Button>
-        <Button variant="ghost" title="Forward 10 frames" onClick={() => stepFrames(10)}>
-          <ChevronsRight size={14} />
-        </Button>
-        <Button variant="ghost" title="Loop" active={loop} onClick={() => setLoop(!loop)}>
-          <Repeat size={14} />
-        </Button>
-        <select className="rounded border border-slate-700 bg-slate-900 px-1 py-0.5 text-[11px]" value={rate} onChange={(e) => setRate(parseFloat(e.target.value))}>
-          {[0.25, 0.5, 1, 2, 4].map((r) => (
-            <option key={r} value={r}>
-              {r}×
+        <span className="w-24 font-mono text-xs text-violet-300">{formatTime(time)}</span>
+        <span className="text-[10px] text-zinc-500">/ duration</span>
+        <div className="w-20">
+          <NumberInput value={duration} min={1} step={1} onChange={(v) => props.onDuration(Math.max(1, v))} />
+        </div>
+        <span className="text-[10px] text-zinc-500">s</span>
+        <div className="mx-2 h-5 w-px bg-zinc-800" />
+        <select
+          className="rounded border border-zinc-700 bg-zinc-900 px-2 py-1 text-xs"
+          value=""
+          onChange={(e) => {
+            if (e.target.value) props.onAdd(e.target.value as EventType);
+          }}
+        >
+          <option value="">+ Add event at playhead…</option>
+          {TRACK_ORDER.map((t) => (
+            <option key={t} value={t}>
+              {EVENT_TYPE_LABELS[t]}
             </option>
           ))}
         </select>
-        <div className="ml-2 font-mono text-xs text-sky-200">
-          {formatElapsed(time)} <span className="text-slate-500">/ {formatElapsed(duration)}</span>
+        <Button onClick={props.onDuplicateSelected} disabled={!selectedId} title="Duplicate (Ctrl+D)">
+          Duplicate
+        </Button>
+        <Button onClick={props.onDeleteSelected} disabled={!selectedId} variant="danger" title="Delete (Del)">
+          Delete
+        </Button>
+        <div className="ml-auto flex items-center gap-2 text-[10px] text-zinc-400">
+          <label className="flex items-center gap-1">
+            <input type="checkbox" checked={snap} onChange={(e) => setSnap(e.target.checked)} /> snap ¼s
+          </label>
+          <span>zoom</span>
+          <input type="range" min={6} max={120} value={pps} onChange={(e) => setPps(+e.target.value)} className="w-28" />
         </div>
-        <div className="font-mono text-xs text-amber-200">{formatDate(dateMs, "D MMM YYYY")}</div>
-        <div className="ml-auto text-[11px] text-slate-500">Click the ruler to seek · click a ◆ to jump to a keyframe · click a track to select</div>
       </div>
 
-      <div className="relative flex min-h-0 flex-1 flex-col">
-      <div className="flex shrink-0">
-        <div className="w-44 shrink-0 border-r border-slate-800">
-          <div className="h-7 border-b border-slate-800 px-2 text-[10px] leading-7 text-slate-500">TRACKS</div>
+      {/* tracks */}
+      <div className="flex min-h-0 flex-1">
+        <div className="w-[150px] shrink-0 border-r border-zinc-800 bg-zinc-900/60">
+          <div className="h-6 border-b border-zinc-800" />
+          {tracks.map((tr) => (
+            <div
+              key={tr.type}
+              style={{ height: tr.lanes * 22 + 6 }}
+              className="flex items-center border-b border-zinc-800/60 px-2 text-[11px] text-zinc-300"
+            >
+              <span className={`mr-2 inline-block h-2 w-2 rounded-sm border ${TRACK_COLORS[tr.type]}`} />
+              {EVENT_TYPE_LABELS[tr.type]}
+            </div>
+          ))}
         </div>
-        <div className="relative flex-1">
-          <div
-            ref={rulerRef}
-            className="relative h-7 cursor-pointer select-none border-b border-slate-800 bg-slate-950"
-            onMouseDown={(e) => {
-              scrubbing.current = true;
-              seekFromEvent(e);
-            }}
-          >
-            {ticks.map((tk, i) => (
-              <div key={i} className="absolute top-0 h-full" style={{ left: pct(tk.t) }}>
-                <div className={`${tk.major ? "h-3 bg-slate-400" : "h-1.5 bg-slate-600"} w-px`} />
-                <div className={`absolute top-3 -translate-x-1/2 whitespace-nowrap text-[10px] ${tk.major ? "text-slate-200" : "text-slate-500"}`}>{tk.label}</div>
+        <div ref={scrollRef} className="relative min-w-0 flex-1 overflow-x-auto overflow-y-auto">
+          <div style={{ width: totalW }} className="relative">
+            {/* ruler */}
+            <div
+              className="sticky top-0 z-10 h-6 cursor-ew-resize border-b border-zinc-800 bg-zinc-950"
+              onPointerDown={onRulerDown}
+              onPointerMove={onRulerMove}
+              onPointerUp={onRulerUp}
+            >
+              {ticks.map((t) => (
+                <div key={t} style={{ left: t * pps }} className="absolute top-0 h-full border-l border-zinc-700 pl-1 font-mono text-[9px] text-zinc-500">
+                  {formatTime(t).slice(0, 5)}
+                </div>
+              ))}
+            </div>
+            {/* rows */}
+            {tracks.map((tr) => (
+              <div key={tr.type} style={{ height: tr.lanes * 22 + 6 }} className="relative border-b border-zinc-800/60">
+                {tr.events.map(({ e, lane }) => {
+                  const w = Math.max(8, (e.end - e.start) * pps);
+                  const sel = e.id === selectedId;
+                  return (
+                    <div
+                      key={e.id}
+                      onPointerDown={(ev) => onEventDown(ev, e)}
+                      onPointerMove={onEventMove}
+                      onPointerUp={onEventUp}
+                      title={`${eventTitle(e)}\n${formatTime(e.start)} → ${formatTime(e.end)}`}
+                      style={{ left: e.start * pps, width: w, top: lane * 22 + 3 }}
+                      className={`absolute h-[19px] cursor-grab select-none overflow-hidden rounded border px-1 text-[10px] leading-[17px] text-white ${TRACK_COLORS[e.type]} ${
+                        sel ? "ring-2 ring-white" : "opacity-90 hover:opacity-100"
+                      }`}
+                    >
+                      <span className="pointer-events-none truncate">{eventTitle(e)}</span>
+                    </div>
+                  );
+                })}
               </div>
             ))}
-            {project.time.pacing.map((p, i) => (
-              <div key={`p${i}`} title={`Pacing: ${p.date} at ${formatElapsed(p.t)}`} className="absolute bottom-0 h-1.5 w-1.5 -translate-x-1/2 rounded-full bg-emerald-400" style={{ left: pct(p.t) }} />
-            ))}
+            {/* playhead */}
+            <div style={{ left: time * pps }} className="pointer-events-none absolute top-0 bottom-0 z-20 w-px bg-red-500">
+              <div className="-ml-[5px] h-0 w-0 border-x-[5px] border-t-[7px] border-x-transparent border-t-red-500" />
+            </div>
           </div>
         </div>
-      </div>
-
-      <div ref={listRef} className="min-h-0 flex-1 overflow-y-auto">
-        {tracks.map((g) => (
-          <div key={g.group}>
-            <div className="sticky top-0 z-10 flex bg-slate-900/95">
-              <div className="w-44 shrink-0 border-r border-slate-800 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wider text-slate-500">{g.group}</div>
-              <div className="flex-1" />
-            </div>
-            {g.items.map((it) => {
-              const isSel = selection && (selection.type === it.sel.type && (selection.id === it.sel.id || it.sel.id === "*" || it.sel.type === "camera"));
-              return (
-                <div key={`${it.sel.type}:${it.sel.id}`} data-track={`${it.sel.type}:${it.sel.id}`} className={`flex h-6 ${isSel ? "bg-sky-900/40" : "hover:bg-slate-800/60"}`}>
-                  <button
-                    className="w-44 shrink-0 truncate border-r border-slate-800 px-2 text-left text-[11px]"
-                    title={it.name}
-                    onClick={() => {
-                      if (it.sel.id === "*") return;
-                      select(it.sel);
-                    }}
-                  >
-                    <span className="mr-1 inline-block h-2 w-2 rounded-sm" style={{ background: it.color }} />
-                    {it.name}
-                  </button>
-                  <div
-                    className="relative flex-1 cursor-pointer"
-                    onMouseDown={(e) => {
-                      if (it.sel.id !== "*") select(it.sel);
-                      const rect = e.currentTarget.getBoundingClientRect();
-                      setTime(((e.clientX - rect.left) / rect.width) * duration);
-                    }}
-                  >
-                    {it.span && (
-                      <div className="absolute top-2 h-2 rounded-sm opacity-60" style={{ left: pct(it.span[0]), width: `calc(${pct(it.span[1])} - ${pct(it.span[0])})`, background: it.color }} />
-                    )}
-                    {it.keyframes.map((t, i) => (
-                      <button
-                        key={i}
-                        className="absolute top-1 h-4 w-4 -translate-x-1/2 text-[10px] leading-4 text-white hover:scale-125"
-                        style={{ left: pct(t) }}
-                        title={formatDate(dateAtTime(project, t), "D MMM YYYY")}
-                        onMouseDown={(e) => {
-                          e.stopPropagation();
-                          setTime(t);
-                          if (it.sel.type === "camera") select({ type: "camera", id: String(i) });
-                          else if (it.sel.id === "*") {
-                            const ev = [...project.events].sort((a, b) => parseDate(a.date) - parseDate(b.date))[i];
-                            if (ev) select({ type: "event", id: ev.id });
-                          } else select(it.sel);
-                        }}
-                      >
-                        ◆
-                      </button>
-                    ))}
-                  </div>
-                </div>
-              );
-            })}
-          </div>
-        ))}
-        <div className="h-4" />
-      </div>
-      <PlayheadOverlay pct={pct(time)} />
-      </div>
-    </div>
-  );
-}
-
-function PlayheadOverlay({ pct }: { pct: string }) {
-  return (
-    <div className="pointer-events-none absolute bottom-0 left-44 right-0 top-0">
-      <div className="absolute bottom-0 top-0 w-px bg-red-500" style={{ left: pct }}>
-        <div className="absolute -left-1.5 -top-1 h-0 w-0 border-l-[6px] border-r-[6px] border-t-[8px] border-l-transparent border-r-transparent border-t-red-500" />
       </div>
     </div>
   );

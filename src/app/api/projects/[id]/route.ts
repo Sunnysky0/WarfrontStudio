@@ -1,51 +1,51 @@
-import { getRepo } from "@/db";
-import { ensureSeeded } from "@/lib/server/seed";
-import type { Project } from "@/lib/types";
+import { NextResponse } from "next/server";
+import { eq } from "drizzle-orm";
+import { db } from "@/db";
+import { projects } from "@/db/schema";
+import type { ProjectDoc } from "@/lib/studio/types";
 
 export const dynamic = "force-dynamic";
 
-type Ctx = { params: Promise<{ id: string }> };
+type Params = { params: Promise<{ id: string }> };
 
-export async function GET(_req: Request, ctx: Ctx) {
+export async function GET(_req: Request, { params }: Params) {
+  const { id } = await params;
   try {
-    await ensureSeeded();
-    const { id } = await ctx.params;
-    const row = await getRepo().getProject(id);
-    if (!row) return Response.json({ error: "Not found" }, { status: 404 });
-    return Response.json(row);
+    const [row] = await db.select().from(projects).where(eq(projects.id, id));
+    if (!row) return NextResponse.json({ error: "Not found" }, { status: 404 });
+    return NextResponse.json(row);
   } catch (e) {
-    return Response.json({ error: (e as Error).message }, { status: 500 });
+    return NextResponse.json({ error: (e as Error).message }, { status: 500 });
   }
 }
 
-export async function PUT(req: Request, ctx: Ctx) {
+export async function PUT(req: Request, { params }: Params) {
+  const { id } = await params;
   try {
-    const { id } = await ctx.params;
-    const body = (await req.json()) as { data: Project; name?: string };
-    if (!body?.data) return Response.json({ error: "Missing data" }, { status: 400 });
-    const name = body.name ?? body.data.name ?? "Untitled";
-    const row = await getRepo().updateProject(id, {
-      data: { ...body.data, name },
-      name,
-      description: body.data.description ?? "",
-    });
-    if (!row) return Response.json({ error: "Not found" }, { status: 404 });
-    return Response.json(row);
+    const body = (await req.json()) as { name?: string; data?: ProjectDoc; thumbnail?: string | null };
+    const patch: Partial<typeof projects.$inferInsert> = { updatedAt: new Date() };
+    if (body.data) {
+      patch.data = body.data;
+      patch.name = body.data.name;
+      patch.description = body.data.description ?? "";
+      patch.durationSeconds = Math.round(body.data.duration);
+    }
+    if (body.name) patch.name = body.name;
+    if (body.thumbnail !== undefined) patch.thumbnail = body.thumbnail;
+    const [row] = await db.update(projects).set(patch).where(eq(projects.id, id)).returning();
+    if (!row) return NextResponse.json({ error: "Not found" }, { status: 404 });
+    return NextResponse.json(row);
   } catch (e) {
-    return Response.json({ error: (e as Error).message }, { status: 500 });
+    return NextResponse.json({ error: (e as Error).message }, { status: 500 });
   }
 }
 
-export async function DELETE(_req: Request, ctx: Ctx) {
+export async function DELETE(_req: Request, { params }: Params) {
+  const { id } = await params;
   try {
-    const { id } = await ctx.params;
-    const db = getRepo();
-    const row = await db.getProject(id);
-    if (!row) return Response.json({ error: "Not found" }, { status: 404 });
-    if (row.isTemplate) return Response.json({ error: "The built-in template cannot be deleted" }, { status: 400 });
-    await db.deleteProject(id);
-    return Response.json({ ok: true });
+    await db.delete(projects).where(eq(projects.id, id));
+    return NextResponse.json({ ok: true });
   } catch (e) {
-    return Response.json({ error: (e as Error).message }, { status: 500 });
+    return NextResponse.json({ error: (e as Error).message }, { status: 500 });
   }
 }

@@ -1,51 +1,61 @@
-import { getRepo } from "@/db";
-import { ensureSeeded } from "@/lib/server/seed";
-import { createBlankProject, createWwiTemplate } from "@/lib/templates/wwi";
-import type { Project } from "@/lib/types";
+import { NextResponse } from "next/server";
+import { desc } from "drizzle-orm";
+import { db } from "@/db";
+import { projects } from "@/db/schema";
+import { greatAsianWarTemplate } from "@/lib/studio/template";
+import { emptyProject } from "@/lib/studio/presets";
+import type { ProjectDoc } from "@/lib/studio/types";
 
 export const dynamic = "force-dynamic";
 
+async function ensureSeed() {
+  const rows = await db.select({ id: projects.id }).from(projects).limit(1);
+  if (rows.length === 0) {
+    const doc = greatAsianWarTemplate();
+    await db.insert(projects).values({
+      name: doc.name,
+      description: doc.description,
+      data: doc,
+      durationSeconds: Math.round(doc.duration),
+    });
+  }
+}
+
 export async function GET() {
   try {
-    await ensureSeeded();
-    const rows = await getRepo().listProjectSummaries();
-    return Response.json(rows);
+    await ensureSeed();
+    const rows = await db
+      .select({
+        id: projects.id,
+        name: projects.name,
+        description: projects.description,
+        durationSeconds: projects.durationSeconds,
+        createdAt: projects.createdAt,
+        updatedAt: projects.updatedAt,
+        thumbnail: projects.thumbnail,
+      })
+      .from(projects)
+      .orderBy(desc(projects.updatedAt));
+    return NextResponse.json(rows);
   } catch (e) {
-    return Response.json({ error: (e as Error).message }, { status: 500 });
+    return NextResponse.json({ error: (e as Error).message }, { status: 500 });
   }
 }
 
 export async function POST(req: Request) {
   try {
-    await ensureSeeded();
-    const db = getRepo();
-    const body = (await req.json().catch(() => ({}))) as { name?: string; from?: "wwi" | "blank"; cloneOf?: string; data?: Project };
-    let data: Project;
-    let name = body.name;
-    if (body.data) {
-      data = body.data;
-      name = name ?? data.name;
-    } else if (body.cloneOf) {
-      const src = await db.getProject(body.cloneOf);
-      if (!src) return Response.json({ error: "Source project not found" }, { status: 404 });
-      data = src.data;
-      name = name ?? `${src.name} (copy)`;
-    } else if (body.from === "wwi") {
-      data = createWwiTemplate();
-      name = name ?? "My WWI warfront";
-    } else {
-      data = createBlankProject(name);
-    }
-    data = { ...data, name: name ?? data.name };
-    const row = await db.insertProject({
-      name: data.name,
-      description: data.description ?? "",
-      data,
-      isTemplate: false,
-      templateKey: body.from === "wwi" || body.cloneOf ? "wwi-derived" : null,
-    });
-    return Response.json({ id: row.id }, { status: 201 });
+    const body = (await req.json().catch(() => ({}))) as { name?: string; template?: string; data?: ProjectDoc };
+    let doc: ProjectDoc;
+    if (body.data) doc = body.data;
+    else if (body.template === "great-asian-war") doc = greatAsianWarTemplate();
+    else doc = emptyProject(body.name ?? "Untitled warfront");
+    if (body.name) doc.name = body.name;
+    const [row] = await db
+      .insert(projects)
+      .values({ name: doc.name, description: doc.description ?? "", data: doc, durationSeconds: Math.round(doc.duration) })
+      .returning();
+    return NextResponse.json(row, { status: 201 });
   } catch (e) {
-    return Response.json({ error: (e as Error).message }, { status: 500 });
+    return NextResponse.json({ error: (e as Error).message }, { status: 500 });
   }
 }

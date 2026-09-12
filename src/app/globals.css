@@ -1,1 +1,30 @@
 @import "tailwindcss";
+
+:root {
+  color-scheme: dark;
+}
+
+html,
+body {
+  height: 100%;
+  overscroll-behavior: none;
+}
+
+/* slimmer scrollbars for the studio panels */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: #3f3f46 transparent;
+}
+*::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+*::-webkit-scrollbar-thumb {
+  background: #3f3f46;
+  border-radius: 4px;
+}
+
+input[type="range"] {
+  accent-color: #7c3aed;
+  width: 100%;
+}

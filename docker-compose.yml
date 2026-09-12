@@ -1,0 +1,22 @@
+# Local Postgres for the studio. `npm run db:up` starts this via Docker Desktop.
+# Loopback traffic to 5432 must stay off the system VPN proxy (127.0.0.1:18081).
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:5432:5432"
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: app_db
+    volumes:
+      - warfront_pg:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d app_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+volumes:
+  warfront_pg:

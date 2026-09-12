@@ -19,14 +19,20 @@ dist/
 .env.*
 !.env.example
 
-# local studio stores
-# file-repo persist (used when DATABASE_URL is unset)
+# local Postgres (scripts/pg-local.mjs zonky fallback)
 .data/
-# geodata download cache for scripts/build-basemap.mjs
+# zonky binaries + any local download caches
 .cache/
 
 # local tooling
 .codegraph/
+.eslintcache
+
+# accidental local exports / renders
+exports/
+renders/
+/*.mp4
+/*.webm
 
 # logs / debug
 *.log
@@ -45,7 +51,9 @@ coverage/
 # OS
 .DS_Store
 Thumbs.db
+ehthumbs.db
 Desktop.ini
+$RECYCLE.BIN/
 
 # editors
 .idea/
