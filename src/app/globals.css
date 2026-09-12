@@ -1,7 +1,93 @@
 @import "tailwindcss";
 
+/* ---------------------------------------------------------------------------
+   Warfront design tokens. This block is the single source of truth for the
+   editor chrome palette; Tailwind v4 generates utilities from every entry
+   (bg-wf-surface, text-wf-text-3, border-wf-line, ring-wf-accent, ...).
+   Canvas/video colours are NOT here — those live in src/lib/studio/themes.ts
+   and must stay independent so export output never tracks the UI skin.
+--------------------------------------------------------------------------- */
+@theme {
+  /* surfaces: near-black with a green cast */
+  --color-wf-void: #0e1111;
+  --color-wf-stage: #111415;
+  --color-wf-lane: #151a17;
+  --color-wf-bg: #171a1b;
+  --color-wf-surface: #1a1d1e;
+  --color-wf-band: #1b231b;
+  --color-wf-raised: #1e2121;
+  --color-wf-raised-2: #232624;
+
+  /* borders */
+  --color-wf-line: #2b2f30;
+  --color-wf-line-soft: #232827;
+  --color-wf-line-warm: #2d332b;
+
+  /* the one accent */
+  --color-wf-accent: #c0d999;
+  --color-wf-accent-hi: #d2e7ae;
+  --color-wf-accent-ink: #1b2515;
+  --color-wf-accent-soft: #2b3328;
+  --color-wf-accent-mid: #39462c;
+  --color-wf-accent-text: #bed596;
+
+  /* text ramp */
+  --color-wf-text: #e6ece0;
+  --color-wf-text-2: #c4cdba;
+  --color-wf-text-3: #949d91;
+  --color-wf-text-4: #697066;
+  --color-wf-text-5: #4e554b;
+
+  /* status */
+  --color-wf-ok: #8fbf7a;
+  --color-wf-warn: #d8b26a;
+  --color-wf-danger: #d98080;
+
+  /* type scale — paired size/line-height so text-wf-md sets both */
+  --text-wf-xs: 0.5625rem;
+  --text-wf-xs--line-height: 1rem;
+  --text-wf-sm: 0.625rem;
+  --text-wf-sm--line-height: 1rem;
+  --text-wf-base: 0.6875rem;
+  --text-wf-base--line-height: 1.05rem;
+  --text-wf-md: 0.75rem;
+  --text-wf-md--line-height: 1.15rem;
+  --text-wf-lg: 0.8125rem;
+  --text-wf-lg--line-height: 1.25rem;
+  --text-wf-xl: 0.9375rem;
+  --text-wf-xl--line-height: 1.4rem;
+
+  --radius-wf-sm: 4px;
+  --radius-wf-md: 6px;
+  --radius-wf-lg: 8px;
+  --radius-wf-xl: 10px;
+
+  --font-wf-ui: Inter, ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  --font-wf-display: Montserrat, Inter, ui-sans-serif, system-ui, sans-serif;
+}
+
+/* ---------------------------------------------------------------------------
+   Layout geometry. Every studio region sizes itself off one of these, so the
+   shell can be retuned from here instead of hunting arbitrary values.
+--------------------------------------------------------------------------- */
 :root {
   color-scheme: dark;
+
+  --wf-h-header: 64px;
+  --wf-h-menubar: 32px;
+  --wf-w-rail: 64px;
+  --wf-w-left: 248px;
+  --wf-h-scene: 34px;
+  --wf-h-toolbar: 42px;
+  --wf-h-viewbar: 32px;
+  --wf-w-right: 296px;
+  --wf-h-timeline: 244px;
+  --wf-h-tl-header: 38px;
+  --wf-w-trackhead: 168px;
+  --wf-h-status: 26px;
+  /* Row geometry inside the timeline (lane / clip / ruler height) is *not*
+     here: it feeds JS layout maths in Timeline.tsx, so it lives there as
+     LANE_H / CLIP_H / RULER_H rather than being declared in two places. */
 }
 
 html,
@@ -10,21 +96,57 @@ body {
   overscroll-behavior: none;
 }
 
+body {
+  font-family: var(--font-wf-ui);
+}
+
 /* slimmer scrollbars for the studio panels */
 * {
   scrollbar-width: thin;
-  scrollbar-color: #3f3f46 transparent;
+  scrollbar-color: var(--color-wf-line) transparent;
 }
 *::-webkit-scrollbar {
   width: 8px;
   height: 8px;
 }
 *::-webkit-scrollbar-thumb {
-  background: #3f3f46;
+  background: var(--color-wf-line);
   border-radius: 4px;
+}
+*::-webkit-scrollbar-thumb:hover {
+  background: var(--color-wf-line-warm);
+}
+*::-webkit-scrollbar-corner {
+  background: transparent;
 }
 
 input[type="range"] {
-  accent-color: #7c3aed;
+  accent-color: var(--color-wf-accent);
   width: 100%;
+}
+
+@layer utilities {
+  /* Applied to every interactive element. Keyboard-only by design: the mock
+     has no persistent outlines, but the app previously had no focus ring at
+     all, which made it unusable without a mouse. */
+  .wf-focus {
+    outline: none;
+  }
+  .wf-focus:focus-visible {
+    outline: 2px solid color-mix(in oklab, var(--color-wf-accent) 65%, transparent);
+    outline-offset: 1px;
+    border-radius: var(--radius-wf-sm);
+  }
+
+  /* Timecodes and numeric readouts must not jitter while scrubbing. */
+  .tnum {
+    font-variant-numeric: tabular-nums;
+    font-feature-settings: "tnum" 1;
+  }
+
+  .wf-wordmark {
+    font-family: var(--font-wf-display);
+    font-weight: 800;
+    letter-spacing: 0.18em;
+  }
 }

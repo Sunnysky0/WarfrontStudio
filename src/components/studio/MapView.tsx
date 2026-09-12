@@ -25,6 +25,8 @@ export interface MapViewProps {
   crosshair?: [number, number] | null;
   renderVersion: number;
   showHud: boolean;
+  /** Chapter title for the bottom-left stage overlay (derived, see SceneStrip). */
+  caption?: string;
 }
 
 export default function MapView(props: MapViewProps) {
@@ -222,13 +224,13 @@ export default function MapView(props: MapViewProps) {
   const cursor = tool === "pan" ? "grab" : tool === "marker" || tool === "pick" ? "crosshair" : "default";
 
   return (
-    <div className="relative flex h-full w-full items-center justify-center overflow-hidden bg-black">
+    <div className="relative flex h-full w-full items-center justify-center overflow-hidden bg-wf-void p-4">
       <canvas
         ref={canvasRef}
         width={W}
         height={H}
         style={{ cursor, maxWidth: "100%", maxHeight: "100%", aspectRatio: `${W} / ${H}` }}
-        className="block h-auto w-auto select-none shadow-2xl"
+        className="block h-auto w-auto select-none rounded-wf-sm shadow-2xl shadow-black/70 ring-1 ring-wf-line"
         onPointerDown={onPointerDown}
         onPointerMove={onPointerMove}
         onPointerUp={onPointerUp}
@@ -239,9 +241,34 @@ export default function MapView(props: MapViewProps) {
         onWheel={onWheel}
         onContextMenu={(e) => e.preventDefault()}
       />
-      <div className="pointer-events-none absolute bottom-2 left-2 rounded bg-black/60 px-2 py-1 font-mono text-[10px] text-zinc-300">
-        {cursorInfo || "Drag to pan · wheel to zoom · click a region to select · shift+drag to paint"}
-      </div>
+
+      {/* Stage overlays. Deliberately on the stage surround, never on the canvas:
+          anything drawn over the canvas would be mistaken for part of the video. */}
+      <Corner className="top-2 left-3">{project.name}</Corner>
+      <Corner className="top-2 right-3">
+        <span className="tnum">
+          {W} × {H}
+        </span>
+        <span className="text-wf-text-5">·</span>
+        {/* Frame rate is chosen at export time, not stored on the document. */}
+        <span className="tnum">{project.duration}s</span>
+      </Corner>
+      {props.caption && (
+        <Corner className="bottom-2 left-3 max-w-[45%]">
+          <span className="truncate">{props.caption}</span>
+        </Corner>
+      )}
+      <Corner className="right-3 bottom-2">
+        <span className="tnum">{cursorInfo || "—"}</span>
+      </Corner>
+    </div>
+  );
+}
+
+function Corner({ children, className }: { children: React.ReactNode; className?: string }) {
+  return (
+    <div className={`pointer-events-none absolute flex items-center gap-1.5 text-wf-xs font-semibold tracking-[0.06em] text-wf-text-4 uppercase ${className ?? ""}`}>
+      {children}
     </div>
   );
 }

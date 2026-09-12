@@ -1,19 +1,29 @@
 "use client";
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import Link from "next/link";
 import { loadBasemap, type Basemap, type RegionFeature } from "@/lib/studio/basemap";
 import { MapRenderer } from "@/lib/studio/renderer";
 import type { Camera, EventType, FlagSpec, FrontMode, MapSettings, MarkerKind, Nation, ProjectDoc, StudioEvent } from "@/lib/studio/types";
 import { uid } from "@/lib/studio/types";
-import { MARKER_KINDS } from "@/lib/studio/drawing";
 import MapView, { type Tool } from "./MapView";
 import Timeline from "./Timeline";
-import Inspector from "./Inspector";
+import Inspector, { type PropsTab } from "./Inspector";
 import Panels, { type LeftTab } from "./Panels";
 import ExportDialog from "./ExportDialog";
-import { Button } from "./ui";
+import Header, { type SaveState } from "./chrome/Header";
+import MenuBar from "./chrome/MenuBar";
+import IconRail from "./chrome/IconRail";
+import MapToolbar from "./chrome/MapToolbar";
+import SceneStrip, { activeChapter } from "./chrome/SceneStrip";
+import ViewBar from "./chrome/ViewBar";
+import StatusBar from "./chrome/StatusBar";
 
-type SaveState = "saved" | "dirty" | "saving" | "error";
+/** Add/remove without mutating — these sets feed React state. */
+function toggled<T>(set: Set<T>, v: T): Set<T> {
+  const next = new Set(set);
+  if (next.has(v)) next.delete(v);
+  else next.add(v);
+  return next;
+}
 
 export default function Studio({ projectId, initial }: { projectId: string; initial: ProjectDoc }) {
   // ------------------------------------------------------------ document state + history
@@ -63,7 +73,6 @@ export default function Studio({ projectId, initial }: { projectId: string; init
   const [regionMode, setRegionMode] = useState<"country" | "province">("country");
   const [markerKind, setMarkerKind] = useState<MarkerKind>("explosion");
   const [viewCamera, setViewCamera] = useState<Camera | null>(null);
-  const [leftTab, setLeftTab] = useState<LeftTab>("nations");
   const [showExport, setShowExport] = useState(false);
   const [showHud, setShowHud] = useState(true);
   const [basemap, setBasemap] = useState<Basemap | null>(null);
@@ -72,6 +81,16 @@ export default function Studio({ projectId, initial }: { projectId: string; init
   const [renderVersion, setRenderVersion] = useState(0);
   const pickRef = useRef<((ll: [number, number]) => void) | null>(null);
   const prevToolRef = useRef<Tool>("select");
+
+  // ------------------------------------------------------------ chrome state
+  // Purely presentational: none of this is persisted to the document, so it can
+  // never desync the preview from the export.
+  const [leftTab, setLeftTab] = useState<LeftTab>("layers");
+  const [propsTab, setPropsTab] = useState<PropsTab>("map");
+  const [leftOpen, setLeftOpen] = useState(true);
+  const [rightOpen, setRightOpen] = useState(true);
+  const [collapsedTracks, setCollapsedTracks] = useState<Set<EventType>>(new Set());
+  const [lockedTracks, setLockedTracks] = useState<Set<EventType>>(new Set());
 
   const renderer = useMemo(() => new MapRenderer(initial), [initial]);
   renderer.setProject(project);
@@ -151,6 +170,9 @@ export default function Studio({ projectId, initial }: { projectId: string; init
     for (const v of state.ownership.values()) m.set(v, (m.get(v) ?? 0) + 1);
     return m;
   }, [state]);
+  // Same derivation the scene strip uses, so the strip chip and the stage
+  // caption can never disagree.
+  const caption = useMemo(() => activeChapter(project, time).title, [project, time]);
 
   // ------------------------------------------------------------ mutations
   const updateEvent = useCallback(
@@ -164,6 +186,7 @@ export default function Studio({ projectId, initial }: { projectId: string; init
     [setProject]
   );
   const updateMap = useCallback((patch: Partial<MapSettings>) => setProject((p) => ({ ...p, map: { ...p.map, ...patch } })), [setProject]);
+  const updateProject = useCallback((patch: Partial<ProjectDoc>) => setProject((p) => ({ ...p, ...patch })), [setProject]);
 
   const addEvent = useCallback(
     (type: EventType, extra: Partial<StudioEvent> = {}) => {
@@ -208,6 +231,7 @@ export default function Studio({ projectId, initial }: { projectId: string; init
       setProject((p) => ({ ...p, events: [...p.events, ev] }));
       setSelectedEventId(ev.id);
       setSelectedNationId(null);
+      setPropsTab("event");
       return ev;
     },
     [currentCamera, markerKind, selectedNationId, selection, setProject]
@@ -233,6 +257,7 @@ export default function Studio({ projectId, initial }: { projectId: string; init
     setProject((p) => ({ ...p, nations: [...p.nations, n] }));
     setSelectedNationId(n.id);
     setSelectedEventId(null);
+    setPropsTab("nation");
     setLeftTab("nations");
   }, [selection, setProject]);
 
@@ -252,6 +277,18 @@ export default function Studio({ projectId, initial }: { projectId: string; init
     },
     [addEvent, selection]
   );
+
+  /** Left-panel shortcut: hand the painted regions to a nation with an auto frontline. */
+  const autoDraw = useCallback(() => {
+    const nationId = selectedNationId ?? projectRef.current.nations[0]?.id;
+    if (!nationId) {
+      // Nowhere to hand the regions — send the user where they can make a nation.
+      setLeftTab("nations");
+      setLeftOpen(true);
+      return;
+    }
+    assignSelection(nationId, "auto", 3);
+  }, [assignSelection, selectedNationId]);
 
   const setKeyframeFromView = useCallback(() => {
     const t = Math.round(timeRef.current * 10) / 10;
@@ -285,6 +322,30 @@ export default function Studio({ projectId, initial }: { projectId: string; init
     },
     [addEvent, markerKind, tool]
   );
+
+  // Selection helpers. Each also moves the Properties panel to the matching
+  // editor — done here rather than in an effect on the ids, so the tab switch
+  // is part of the same render as the selection instead of a second pass.
+  const selectEvent = useCallback((id: string | null) => {
+    setSelectedEventId(id);
+    if (id) {
+      setSelectedNationId(null);
+      setPropsTab("event");
+      setRightOpen(true);
+    }
+  }, []);
+  const selectNation = useCallback((id: string | null) => {
+    setSelectedNationId(id);
+    if (id) {
+      setSelectedEventId(null);
+      setPropsTab("nation");
+      setRightOpen(true);
+    }
+  }, []);
+  const openGuide = useCallback(() => {
+    setLeftTab("help");
+    setLeftOpen(true);
+  }, []);
 
   // ------------------------------------------------------------ keyboard
   useEffect(() => {
@@ -331,57 +392,60 @@ export default function Studio({ projectId, initial }: { projectId: string; init
   }, [deleteSelected, duplicateSelected, redo, save, tool, undo]);
 
   // ------------------------------------------------------------ layout
-  const saveLabel = { saved: "All changes saved", dirty: "Unsaved changes…", saving: "Saving…", error: "Save failed – retry" }[saveState];
-  const tabBtn = (id: LeftTab, label: string) => (
-    <button key={id} onClick={() => setLeftTab(id)} className={`flex-1 py-1.5 text-[11px] font-medium ${leftTab === id ? "border-b-2 border-violet-500 text-white" : "text-zinc-400 hover:text-zinc-200"}`}>
-      {label}
-    </button>
-  );
-  const toolBtn = (id: Tool, label: string, title: string) => (
-    <button key={id} title={title} onClick={() => setTool(id)} className={`rounded px-2 py-1 text-[11px] ${tool === id ? "bg-violet-600 text-white" : "bg-zinc-800 text-zinc-300 hover:bg-zinc-700"}`}>
-      {label}
-    </button>
-  );
-
   return (
-    <div className="flex h-screen w-screen flex-col overflow-hidden bg-zinc-950 text-zinc-100">
-      {/* header */}
-      <header className="flex h-11 shrink-0 items-center gap-3 border-b border-zinc-800 bg-zinc-900 px-3">
-        <Link href="/" className="text-xs text-zinc-400 hover:text-white">
-          ← Projects
-        </Link>
-        <span className="text-sm font-semibold tracking-wide text-white">⚔ Warfront Animation Studio</span>
-        <span className="truncate text-xs text-zinc-400">/ {project.name}</span>
-        <span className={`ml-2 text-[10px] ${saveState === "error" ? "text-red-400" : saveState === "saved" ? "text-emerald-400" : "text-amber-300"}`}>{saveLabel}</span>
-        <div className="ml-auto flex items-center gap-1.5">
-          <Button onClick={undo} title="Undo (Ctrl+Z)">
-            ↶
-          </Button>
-          <Button onClick={redo} title="Redo (Ctrl+Y)">
-            ↷
-          </Button>
-          <Button onClick={() => setShowHud((v) => !v)} title="Toggle HUD preview (year, flags, subtitles)">
-            HUD {showHud ? "on" : "off"}
-          </Button>
-          <Button onClick={save} disabled={saveState === "saving"}>
-            Save
-          </Button>
-          <Button variant="primary" onClick={() => setShowExport(true)} disabled={!basemap}>
-            ⬇ Export video
-          </Button>
-        </div>
-      </header>
+    <div className="flex h-screen w-screen flex-col overflow-hidden bg-wf-bg font-wf-ui text-wf-text-2">
+      <Header
+        projectName={project.name}
+        duration={project.duration}
+        saveState={saveState}
+        playing={playing}
+        exportDisabled={!basemap}
+        onRename={(name) => updateProject({ name })}
+        onSave={save}
+        onUndo={undo}
+        onRedo={redo}
+        onTogglePlay={() => setPlaying((p) => !p)}
+        onExport={() => setShowExport(true)}
+      />
+
+      <MenuBar
+        projectName={project.name}
+        hasEvent={!!selectedEventId}
+        hasSelection={selection.size > 0}
+        showHud={showHud}
+        leftOpen={leftOpen}
+        rightOpen={rightOpen}
+        regionMode={regionMode}
+        tool={tool}
+        viewDetached={!!viewCamera}
+        onSave={save}
+        onExport={() => setShowExport(true)}
+        onUndo={undo}
+        onRedo={redo}
+        onDuplicate={duplicateSelected}
+        onDelete={deleteSelected}
+        onClearSelection={() => setSelection(new Set())}
+        onToggleHud={() => setShowHud((v) => !v)}
+        onToggleLeft={() => setLeftOpen((v) => !v)}
+        onToggleRight={() => setRightOpen((v) => !v)}
+        onRegionMode={setRegionMode}
+        onTool={setTool}
+        onSetKeyframe={setKeyframeFromView}
+        onFollowTimeline={() => setViewCamera(null)}
+        onGuide={openGuide}
+      />
 
       <div className="flex min-h-0 flex-1">
-        {/* left panel */}
-        <aside className="flex w-[290px] shrink-0 flex-col border-r border-zinc-800 bg-zinc-900/70">
-          <div className="flex border-b border-zinc-800">
-            {tabBtn("nations", "Nations")}
-            {tabBtn("map", "Map")}
-            {tabBtn("assets", "Assets")}
-            {tabBtn("help", "Help")}
-          </div>
-          <div className="min-h-0 flex-1">
+        <IconRail
+          tab={leftTab}
+          onTab={(t) => {
+            setLeftTab(t);
+            setLeftOpen(true);
+          }}
+        />
+
+        {leftOpen && (
+          <aside className="flex min-h-0 shrink-0 flex-col overflow-hidden border-r border-wf-line bg-wf-surface" style={{ width: "var(--wf-w-left)" }}>
             <Panels
               tab={leftTab}
               project={project}
@@ -389,13 +453,11 @@ export default function Studio({ projectId, initial }: { projectId: string; init
               basemapLoading={basemapLoading}
               selectedNationId={selectedNationId}
               ownedBy={ownedBy}
-              onSelectNation={(id) => {
-                setSelectedNationId(id);
-                if (id) setSelectedEventId(null);
-              }}
+              selectionCount={selection.size}
+              onSelectNation={selectNation}
               onAddNation={addNation}
               onUpdateMap={updateMap}
-              onUpdateProject={(patch) => setProject((p) => ({ ...p, ...patch }))}
+              onUpdateProject={updateProject}
               currentCamera={currentCamera}
               onAddMarker={(kind) => {
                 setMarkerKind(kind);
@@ -403,119 +465,118 @@ export default function Studio({ projectId, initial }: { projectId: string; init
               }}
               onApplyFlag={(spec: FlagSpec) => selectedNationId && updateNation(selectedNationId, { flag: spec })}
               onApplyColor={(color) => selectedNationId && updateNation(selectedNationId, { color })}
+              onOpenMapProperties={() => {
+                setPropsTab("map");
+                setRightOpen(true);
+              }}
+              onAutoDraw={autoDraw}
             />
-          </div>
-        </aside>
+          </aside>
+        )}
 
-        {/* center */}
-        <main className="relative flex min-w-0 flex-1 flex-col">
-          <div className="flex items-center gap-2 border-b border-zinc-800 bg-zinc-900/60 px-2 py-1">
-            {toolBtn("select", "⬚ Select", "Select regions (click, shift+drag to paint)")}
-            {toolBtn("pan", "✋ Pan", "Pan the map")}
-            {toolBtn("marker", "◎ Marker", "Click on the map to drop a marker at the playhead")}
-            {tool === "marker" && (
-              <select value={markerKind} onChange={(e) => setMarkerKind(e.target.value as MarkerKind)} className="rounded border border-zinc-700 bg-zinc-900 px-1 py-0.5 text-[11px]">
-                {MARKER_KINDS.map((m) => (
-                  <option key={m.id} value={m.id}>
-                    {m.label}
-                  </option>
-                ))}
-              </select>
+        {/* Centre column. The timeline lives in here so it spans the stage and
+            the Properties panel, while the rail and left panel run full height. */}
+        <div className="flex min-w-0 flex-1 flex-col">
+          <div className="flex min-h-0 flex-1">
+            <main className="flex min-w-0 flex-1 flex-col">
+              <SceneStrip project={project} time={time} onSeek={setTime} onAddYear={() => addEvent("year")} />
+              <MapToolbar
+                tool={tool}
+                onTool={setTool}
+                markerKind={markerKind}
+                onMarkerKind={setMarkerKind}
+                regionMode={regionMode}
+                onRegionMode={setRegionMode}
+                showHud={showHud}
+                onToggleHud={() => setShowHud((v) => !v)}
+                viewDetached={!!viewCamera}
+                onFollowTimeline={() => setViewCamera(null)}
+                onSetKeyframe={setKeyframeFromView}
+                map={project.map}
+                onUpdateMap={updateMap}
+              />
+              <div className="relative min-h-0 flex-1">
+                <MapView
+                  renderer={renderer}
+                  project={project}
+                  basemap={basemap}
+                  time={time}
+                  viewCamera={viewCamera}
+                  onViewCamera={setViewCamera}
+                  selection={selection}
+                  onSelectionChange={setSelection}
+                  tool={tool}
+                  regionMode={regionMode}
+                  onMapClick={onMapClick}
+                  renderVersion={renderVersion}
+                  showHud={showHud}
+                  caption={caption}
+                />
+                {/* Basemap progress lives in the status bar; only the failure
+                    case needs to interrupt, because the stage stays empty. */}
+                {basemapError && (
+                  <div className="absolute inset-x-0 top-3 flex justify-center px-3">
+                    <span className="rounded-wf-md border border-wf-danger/40 bg-wf-danger/15 px-3 py-1.5 text-wf-md text-wf-danger">
+                      Basemap failed to load: {basemapError}
+                    </span>
+                  </div>
+                )}
+              </div>
+              <ViewBar tool={tool} camera={currentCamera} detached={!!viewCamera} onCamera={setViewCamera} onFollowTimeline={() => setViewCamera(null)} />
+            </main>
+
+            {rightOpen && (
+              <aside className="min-h-0 shrink-0 overflow-hidden border-l border-wf-line bg-wf-surface" style={{ width: "var(--wf-w-right)" }}>
+                <Inspector
+                  project={project}
+                  basemap={basemap}
+                  basemapLoading={basemapLoading}
+                  mode={propsTab}
+                  onMode={setPropsTab}
+                  selectedEvent={selectedEvent}
+                  selectedNation={selectedNation}
+                  selection={selection}
+                  time={time}
+                  currentCamera={currentCamera}
+                  onUpdateEvent={(id, patch) => updateEvent(id, patch, true)}
+                  onUpdateNation={updateNation}
+                  onDeleteNation={deleteNation}
+                  onUpdateMap={updateMap}
+                  onUpdateProject={updateProject}
+                  onPick={startPick}
+                  onSelectionChange={setSelection}
+                  onAssignSelection={assignSelection}
+                  onSelectNation={selectNation}
+                />
+              </aside>
             )}
-            {tool === "pick" && <span className="animate-pulse rounded bg-violet-900/60 px-2 py-0.5 text-[11px] text-violet-200">Click on the map to pick a point (Esc to cancel)</span>}
-            <div className="mx-1 h-5 w-px bg-zinc-800" />
-            <span className="text-[10px] text-zinc-500">Unit:</span>
-            <button onClick={() => setRegionMode("country")} className={`rounded px-2 py-0.5 text-[11px] ${regionMode === "country" ? "bg-zinc-200 text-black" : "bg-zinc-800 text-zinc-300"}`}>
-              Countries
-            </button>
-            <button onClick={() => setRegionMode("province")} className={`rounded px-2 py-0.5 text-[11px] ${regionMode === "province" ? "bg-zinc-200 text-black" : "bg-zinc-800 text-zinc-300"}`}>
-              Provinces
-            </button>
-            <div className="mx-1 h-5 w-px bg-zinc-800" />
-            <Button size="xs" variant="primary" onClick={setKeyframeFromView} title="Create a camera keyframe ending at the playhead with the current view">
-              ⌖ Set camera keyframe from view
-            </Button>
-            {viewCamera && (
-              <Button size="xs" onClick={() => setViewCamera(null)} title="Re-attach the preview to the timeline camera">
-                ↩ Follow timeline camera
-              </Button>
-            )}
-            <span className="ml-auto font-mono text-[10px] text-zinc-500">
-              {currentCamera.lat.toFixed(2)}°, {currentCamera.lon.toFixed(2)}° · scale {currentCamera.scale.toFixed(0)} {viewCamera ? "(detached view)" : ""}
-            </span>
           </div>
-          <div className="relative min-h-0 flex-1">
-            <MapView
-              renderer={renderer}
+
+          {/* Timeline draws its own top border. */}
+          <div className="shrink-0" style={{ height: "var(--wf-h-timeline)" }}>
+            <Timeline
               project={project}
-              basemap={basemap}
               time={time}
-              viewCamera={viewCamera}
-              onViewCamera={setViewCamera}
-              selection={selection}
-              onSelectionChange={setSelection}
-              tool={tool}
-              regionMode={regionMode}
-              onMapClick={onMapClick}
-              renderVersion={renderVersion}
-              showHud={showHud}
+              playing={playing}
+              selectedId={selectedEventId}
+              collapsed={collapsedTracks}
+              locked={lockedTracks}
+              onToggleCollapsed={(t) => setCollapsedTracks((s) => toggled(s, t))}
+              onToggleLocked={(t) => setLockedTracks((s) => toggled(s, t))}
+              onSelect={selectEvent}
+              onSeek={setTime}
+              onTogglePlay={() => setPlaying((p) => !p)}
+              onUpdateEvent={updateEvent}
+              onAdd={(type) => addEvent(type)}
+              onDuration={(d) => updateProject({ duration: d })}
+              onDeleteSelected={deleteSelected}
+              onDuplicateSelected={duplicateSelected}
             />
-            {basemapLoading && (
-              <div className="pointer-events-none absolute inset-x-0 top-2 flex justify-center">
-                <span className="rounded bg-black/70 px-3 py-1 text-xs text-violet-200">Loading {project.map.lod} basemap ({project.map.borderYear})…</span>
-              </div>
-            )}
-            {basemapError && (
-              <div className="absolute inset-x-0 top-2 flex justify-center">
-                <span className="rounded bg-red-950/90 px-3 py-1 text-xs text-red-200">Basemap failed to load: {basemapError}</span>
-              </div>
-            )}
           </div>
-        </main>
-
-        {/* right panel */}
-        <aside className="w-[330px] shrink-0 border-l border-zinc-800 bg-zinc-900/70">
-          <Inspector
-            project={project}
-            basemap={basemap}
-            selectedEvent={selectedEvent}
-            selectedNation={selectedNation}
-            selection={selection}
-            time={time}
-            currentCamera={currentCamera}
-            onUpdateEvent={(id, patch) => updateEvent(id, patch, true)}
-            onUpdateNation={updateNation}
-            onDeleteNation={deleteNation}
-            onPick={startPick}
-            onSelectionChange={setSelection}
-            onAssignSelection={assignSelection}
-            onSelectNation={setSelectedNationId}
-          />
-        </aside>
+        </div>
       </div>
 
-      {/* timeline */}
-      <div className="h-[270px] shrink-0">
-        <Timeline
-          project={project}
-          time={time}
-          playing={playing}
-          selectedId={selectedEventId}
-          onSelect={(id) => {
-            setSelectedEventId(id);
-            if (id) setSelectedNationId(null);
-          }}
-          onSeek={(t) => {
-            setTime(t);
-          }}
-          onTogglePlay={() => setPlaying((p) => !p)}
-          onUpdateEvent={updateEvent}
-          onAdd={(type) => addEvent(type)}
-          onDuration={(d) => setProject((p) => ({ ...p, duration: d }))}
-          onDeleteSelected={deleteSelected}
-          onDuplicateSelected={duplicateSelected}
-        />
-      </div>
+      <StatusBar project={project} saveState={saveState} basemapLoading={basemapLoading} onGuide={openGuide} />
 
       {showExport && <ExportDialog project={project} basemap={basemap} time={time} onClose={() => setShowExport(false)} />}
     </div>

@@ -1,11 +1,12 @@
 "use client";
 import React, { useEffect, useRef, useState } from "react";
+import { AlertTriangle, CheckCircle2, Download, Image as ImageIcon, X } from "lucide-react";
 import type { Basemap } from "@/lib/studio/basemap";
 import { MapRenderer } from "@/lib/studio/renderer";
 import { downloadBlob, exportFrame, exportVideo, webCodecsAvailable } from "@/lib/studio/export";
 import { RESOLUTION_PRESETS } from "@/lib/studio/presets";
 import type { ProjectDoc } from "@/lib/studio/types";
-import { Button, Field, NumberInput, Select } from "./ui";
+import { Button, Field, IconButton, NumberInput, Select } from "./ui";
 
 export default function ExportDialog({ project, basemap, time, onClose }: { project: ProjectDoc; basemap: Basemap | null; time: number; onClose: () => void }) {
   const [format, setFormat] = useState<"mp4" | "webm">("mp4");
@@ -20,6 +21,24 @@ export default function ExportDialog({ project, basemap, time, onClose }: { proj
   const abort = useRef<AbortController | null>(null);
   const [wc, setWc] = useState(true);
   useEffect(() => setWc(webCodecsAvailable()), []);
+
+  // Modal behaviour the dialog never had: Escape closes it, and focus starts
+  // inside so a keyboard user isn't left tabbing through the studio behind it.
+  const panelRef = useRef<HTMLDivElement>(null);
+  const busy = !!progress;
+  useEffect(() => {
+    panelRef.current?.focus();
+  }, []);
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== "Escape") return;
+      if (busy) return; // don't lose a render in progress to a stray Esc
+      e.stopPropagation();
+      onClose();
+    };
+    document.addEventListener("keydown", onKey, true);
+    return () => document.removeEventListener("keydown", onKey, true);
+  }, [busy, onClose]);
 
   const [w, h] = res.split("x").map(Number);
   const frames = Math.round((end - start) * fps);
@@ -60,13 +79,23 @@ export default function ExportDialog({ project, basemap, time, onClose }: { proj
   };
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70" onClick={() => !progress && onClose()}>
-      <div className="w-[520px] rounded-lg border border-zinc-700 bg-zinc-900 p-5 text-xs text-zinc-200 shadow-2xl" onClick={(e) => e.stopPropagation()}>
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-[2px]" onClick={() => !busy && onClose()}>
+      <div
+        ref={panelRef}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="wf-export-title"
+        tabIndex={-1}
+        className="w-[520px] rounded-wf-lg border border-wf-line bg-wf-surface p-5 text-wf-md text-wf-text-2 shadow-2xl shadow-black/70 outline-none"
+        onClick={(e) => e.stopPropagation()}
+      >
         <div className="mb-3 flex items-center justify-between">
-          <h2 className="text-base font-semibold text-white">Export video</h2>
-          <button onClick={onClose} className="text-zinc-400 hover:text-white">
-            ✕
-          </button>
+          <h2 id="wf-export-title" className="text-wf-xl font-semibold text-wf-text">
+            Export video
+          </h2>
+          <IconButton title="Close" onClick={onClose} disabled={busy}>
+            <X size={15} strokeWidth={2} />
+          </IconButton>
         </div>
         <div className="grid grid-cols-2 gap-3">
           <Field label="Format">
@@ -102,45 +131,59 @@ export default function ExportDialog({ project, basemap, time, onClose }: { proj
             <NumberInput value={end} min={0.5} step={0.5} max={project.duration} onChange={(v) => setEnd(Math.min(project.duration, Math.max(v, start + 0.5)))} />
           </Field>
         </div>
-        <p className="mt-3 text-[11px] text-zinc-400">
-          {frames} frames at {w}×{h}.{" "}
-          {wc ? "Frame-accurate offline rendering via WebCodecs." : "WebCodecs is not available in this browser – falling back to real-time WebM recording."}
+        <p className="mt-3 text-wf-base leading-relaxed text-wf-text-4">
+          <span className="tnum text-wf-text-2">
+            {frames} frames at {w}×{h}
+          </span>
+          . {wc ? "Frame-accurate offline rendering via WebCodecs." : "WebCodecs is not available in this browser — falling back to real-time WebM recording."}
         </p>
+
         {progress && (
           <div className="mt-3">
-            <div className="mb-1 flex justify-between text-[11px]">
+            <div className="mb-1 flex justify-between text-wf-base text-wf-text-3">
               <span>{progress.stage}</span>
-              <span>{Math.round((progress.done / Math.max(1, progress.total)) * 100)}%</span>
+              <span className="tnum">{Math.round((progress.done / Math.max(1, progress.total)) * 100)}%</span>
             </div>
-            <div className="h-2 overflow-hidden rounded bg-zinc-800">
-              <div className="h-full bg-violet-500 transition-all" style={{ width: `${(progress.done / Math.max(1, progress.total)) * 100}%` }} />
+            <div className="h-2 overflow-hidden rounded-full bg-wf-lane">
+              <div className="h-full bg-wf-accent transition-all" style={{ width: `${(progress.done / Math.max(1, progress.total)) * 100}%` }} />
             </div>
           </div>
         )}
-        {error && <div className="mt-3 rounded border border-red-900 bg-red-950/50 p-2 text-red-200">{error}</div>}
+
+        {error && (
+          <div className="mt-3 flex items-start gap-2 rounded-wf-md border border-wf-danger/40 bg-wf-danger/10 p-2 text-wf-base text-wf-danger">
+            <AlertTriangle size={14} strokeWidth={1.75} className="mt-px shrink-0" />
+            <span>{error}</span>
+          </div>
+        )}
+
         {result && (
-          <div className="mt-3 rounded border border-emerald-900 bg-emerald-950/40 p-2 text-emerald-200">
-            Exported <b>{result.filename}</b> ({(result.size / 1e6).toFixed(1)} MB, {result.method}).{" "}
-            <a href={result.url} download={result.filename} className="underline">
-              Download again
-            </a>
+          <div className="mt-3 flex items-start gap-2 rounded-wf-md border border-wf-ok/40 bg-wf-ok/10 p-2 text-wf-base text-wf-ok">
+            <CheckCircle2 size={14} strokeWidth={1.75} className="mt-px shrink-0" />
+            <span>
+              Exported <b className="font-semibold">{result.filename}</b> ({(result.size / 1e6).toFixed(1)} MB, {result.method}).{" "}
+              <a href={result.url} download={result.filename} className="underline underline-offset-2 hover:no-underline wf-focus">
+                Download again
+              </a>
+            </span>
           </div>
         )}
+
         <div className="mt-4 flex items-center justify-between">
-          <Button onClick={snapshot} disabled={!!progress}>
-            Snapshot current frame (PNG)
+          <Button onClick={snapshot} disabled={busy}>
+            <ImageIcon size={13} strokeWidth={1.75} />
+            Snapshot frame (PNG)
           </Button>
-          <div className="flex gap-2">
-            {progress ? (
-              <Button variant="danger" onClick={() => abort.current?.abort()}>
-                Cancel
-              </Button>
-            ) : (
-              <Button variant="primary" size="md" onClick={run} disabled={!basemap}>
-                Render & download
-              </Button>
-            )}
-          </div>
+          {busy ? (
+            <Button variant="danger" onClick={() => abort.current?.abort()}>
+              Cancel
+            </Button>
+          ) : (
+            <Button variant="accent" size="md" onClick={run} disabled={!basemap}>
+              <Download size={14} strokeWidth={1.75} />
+              Render &amp; download
+            </Button>
+          )}
         </div>
       </div>
     </div>

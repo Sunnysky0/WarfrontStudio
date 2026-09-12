@@ -44,7 +44,7 @@ There is **no test suite**. After logic changes, run `npm run typecheck`. For re
 | Piece | Choice |
 | --- | --- |
 | App | Next.js 16 App Router, React 19, TypeScript strict |
-| UI | Tailwind 4 (`src/app/globals.css` is `@import "tailwindcss"`), dark zinc chrome, violet accents |
+| UI | Tailwind 4 + `lucide-react` icons. `src/app/globals.css` holds the `@theme` token block (the `wf-*` palette) and the `:root` layout vars — near-black green-tinted chrome, one sage-lime accent |
 | State | React state inside `Studio.tsx` (no Zustand) |
 | Map | d3-geo + d3-geo-projection, TopoJSON in `public/basemap/` |
 | Flags | SVG files in `public/flags/` (`/flags/CN.svg`) plus procedurally drawn custom flags |
@@ -60,7 +60,8 @@ Fonts (Google, loaded in `layout.tsx`): Josefin Sans, Montserrat, Cinzel, Oswald
 ```
 src/
   app/
-    page.tsx                 Project list / create / import / delete
+    globals.css              Design tokens (`@theme`) + layout vars (`:root`)
+    page.tsx                 Workspace: rail (projects / new / assets / guide), project cards, import, delete
     studio/[id]/page.tsx     Server page → client Studio
     api/projects/            GET list + seed, POST create
     api/projects/[id]/       GET / PUT / DELETE
@@ -69,11 +70,16 @@ src/
   components/studio/         Entire editor UI (client)
     Studio.tsx               Document state, undo, autosave, keyboard, layout
     MapView.tsx              Canvas preview, pan/zoom, region hit-test, paint
-    Panels.tsx               Left tabs: nations / map / assets / help
+    Panels.tsx               Left panel: layers tree / nations / assets / guide
+    MapProperties.tsx        Map + project settings (right panel, Map mode)
     Timeline.tsx             Multi-track event editor
-    Inspector.tsx            Selected nation / event
+    Inspector.tsx            Properties panel: Map | Event | Nation
     ExportDialog.tsx         MP4 / WebM / PNG
-    ui.tsx                   Shared Field, Button, Select, …
+    FlagPreview.tsx          Canvas flag thumbnail (shared by both panels)
+    eventStyle.tsx           Per-EventType colour + icon (clips, badges)
+    ui.tsx                   Shared primitives — Button, Select, Segmented, Menu, …
+    chrome/                  Shell: Header, MenuBar, IconRail, SceneStrip,
+                             MapToolbar, ViewBar, StatusBar
   lib/studio/                Domain logic — keep React out of here
     types.ts                 Canonical ProjectDoc (version: 1)
     state.ts                 resolveState(t) — ownership, transfers, HUD
@@ -217,7 +223,11 @@ Tools (`MapView`): `select` (click/drag-paint regions), `pan`, `marker` (click p
 
 Keyboard (ignored while typing in inputs): Space play/pause, arrows ±0.5 s (Shift ±5 s), Home, Delete/Backspace selected event, Ctrl/Cmd+Z undo, Ctrl/Cmd+Shift+Z or Ctrl/Cmd+Y redo, Ctrl/Cmd+D duplicate event, Esc clear selection / cancel pick.
 
-Studio chrome: header | left `Panels` | `MapView` | right `Inspector` | bottom `Timeline` | `ExportDialog`. Shared controls live in `ui.tsx`.
+Studio chrome, outside in: `Header` → `MenuBar` → [`IconRail` | `Panels` | (`SceneStrip` → `MapToolbar` → `MapView` → `ViewBar`) + `Inspector`, with `Timeline` spanning the stage and the Inspector] → `StatusBar`. The rail and left panel run full height; the timeline does not. Shared controls live in `ui.tsx`; region sizes are `--wf-*` vars in `globals.css`.
+
+Panel split: **layers on the left, settings on the right.** `Panels` owns the layer tree (all 15 `LayerId`s, grouped) and the nations/assets/guide tabs; map and project settings live in `MapProperties`, rendered by the Inspector's Map mode. Both call the same `onUpdateMap` / `onUpdateProject`.
+
+`SceneStrip`'s "Scene 04" chip and the map-stage caption are **derived**, not stored — `activeChapter(project, t)` reads the `year` and `subtitle` events. There is no scenes model in `ProjectDoc`. Likewise per-track collapse/lock in the timeline are editor-local state, never render flags, so they cannot desync preview from export.
 
 ## Persistence
 
@@ -270,7 +280,9 @@ Flag / colour presets in `presets.ts` include historical empires and the Great A
 - Functional components + hooks. Studio files are `"use client"`.
 - Server routes stay tiny: seed, drizzle, JSON. No rendering on the server.
 - Match surrounding style: 2-space indent, semicolons, early returns, small helpers next to the call site.
-- Tailwind already in use: `zinc-950/900/800`, `violet-600` accents, `text-xs` / `text-[11px]` inspector chrome. Do not introduce a second design system.
+- Style comes from the tokens in `globals.css`, never raw Tailwind palette colours: surfaces `bg-wf-bg` / `bg-wf-surface` / `bg-wf-raised` / `bg-wf-lane`, borders `border-wf-line`, text ramp `text-wf-text` → `text-wf-text-5`, the single accent `wf-accent` (+ `-hi` / `-ink` / `-soft` / `-mid` / `-text`), type `text-wf-xs` → `text-wf-xl`, radii `rounded-wf-sm/md/lg/xl`. Compose from `ui.tsx`; do not introduce a second design system, and do not add a second accent hue.
+- Every interactive element gets `wf-focus` (keyboard-only focus ring) and numeric readouts get `tnum`.
+- Canvas colours are separate on purpose: `themes.ts` drives the video, `globals.css` drives the DOM. Never wire one to the other.
 - Comments only for non-obvious constraints (region-key aliases, transfer commit timing, camera scale normalization, cache keys).
 - New user-facing map behaviour belongs in `MapRenderer` so export matches preview.
 - New `ProjectDoc` fields: add to `types.ts`, default in `emptyProject` + `greatAsianWarTemplate`, inspector/panels if editable, renderer if visible. Bump `version` only with an explicit migrator.
