@@ -1,6 +1,6 @@
 "use client";
 import React from "react";
-import { Crosshair, Eye, EyeOff, Hand, MapPin, Monitor, MousePointer2, Undo } from "lucide-react";
+import { Crosshair, Eye, EyeOff, Hand, MapPin, Monitor, MousePointer2, Spline, Undo } from "lucide-react";
 import { MARKER_KINDS } from "@/lib/studio/drawing";
 import { RESOLUTION_PRESETS } from "@/lib/studio/presets";
 import type { MapSettings, MarkerKind } from "@/lib/studio/types";
@@ -19,6 +19,8 @@ export default function MapToolbar({
   viewDetached,
   onFollowTimeline,
   onSetKeyframe,
+  frontSelected,
+  onSetFrontKeyframe,
   map,
   onUpdateMap,
 }: {
@@ -33,6 +35,8 @@ export default function MapToolbar({
   viewDetached: boolean;
   onFollowTimeline: () => void;
   onSetKeyframe: () => void;
+  frontSelected?: boolean;
+  onSetFrontKeyframe?: () => void;
   map: MapSettings;
   onUpdateMap: (patch: Partial<MapSettings>) => void;
 }) {
@@ -51,6 +55,9 @@ export default function MapToolbar({
         </IconButton>
         <IconButton title="Click the map to drop a marker at the playhead" variant="ghost" active={tool === "marker"} onClick={() => onTool("marker")}>
           <MapPin size={15} strokeWidth={1.75} />
+        </IconButton>
+        <IconButton title="Draw a frontline — click to place vertices, double-click or Enter to finish" variant="ghost" active={tool === "front"} onClick={() => onTool("front")}>
+          <Spline size={15} strokeWidth={1.75} />
         </IconButton>
       </div>
 
@@ -81,6 +88,11 @@ export default function MapToolbar({
       <IconButton title="Set a camera keyframe from the current view" variant="solid" onClick={onSetKeyframe}>
         <Crosshair size={15} strokeWidth={1.75} />
       </IconButton>
+      {frontSelected && onSetFrontKeyframe && (
+        <IconButton title="Set a frontline keyframe at the playhead" variant="solid" onClick={onSetFrontKeyframe}>
+          <Spline size={15} strokeWidth={1.75} />
+        </IconButton>
+      )}
       {viewDetached && (
         <IconButton title="Re-attach the preview to the timeline camera" variant="solid" onClick={onFollowTimeline}>
           <Undo size={15} strokeWidth={1.75} />

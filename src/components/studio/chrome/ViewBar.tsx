@@ -1,6 +1,6 @@
 "use client";
 import React from "react";
-import { Hand, Maximize2, MousePointer2, MapPin, Minus, Plus, Crosshair, Link2Off } from "lucide-react";
+import { Hand, Maximize2, MousePointer2, MapPin, Minus, Plus, Crosshair, Link2Off, Spline } from "lucide-react";
 import type { Camera } from "@/lib/studio/types";
 import type { Tool } from "../MapView";
 import { Divider, IconButton } from "../ui";
@@ -10,6 +10,7 @@ const HINTS: Record<Tool, { icon: React.ReactNode; text: string }> = {
   pan: { icon: <Hand size={12} strokeWidth={1.75} />, text: "Drag to pan · wheel to zoom" },
   marker: { icon: <MapPin size={12} strokeWidth={1.75} />, text: "Click the map to drop a marker at the playhead" },
   pick: { icon: <Crosshair size={12} strokeWidth={1.75} />, text: "Click a point to fill the field you started from · Esc cancels" },
+  front: { icon: <Spline size={12} strokeWidth={1.75} />, text: "Click to place vertices · double-click or Enter to finish · drag handles to edit · click a segment to insert" },
 };
 
 /**

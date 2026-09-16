@@ -39,6 +39,20 @@ npx tsx scripts/smoke.ts
 
 There is **no test suite**. After logic changes, run `npm run typecheck`. For renderer/editor work, exercise the studio in the browser: open the Great Asian War template, scrub the timeline, paint a province, assign it, export a short clip.
 
+After completing a code task, coding agents **must** refresh the Codegraph index:
+
+```bash
+codegraph sync
+```
+
+Do this before stopping, even for UI-only or markdown-only edits. The index lags writes; skipping it leaves the next session on a stale graph.
+
+## Codegraph
+
+This repo is indexed at `.codegraph/`. Prefer the Codegraph MCP tools (`codegraph_explore` first, then `codegraph_node` / callers / callees / impact) over grepping the tree for “how does X work”, “where is X”, or tracing a flow.
+
+`codegraph sync` is **required** at the end of every code task. It is not optional cleanup.
+
 ## Stack
 
 | Piece | Choice |
@@ -53,7 +67,7 @@ There is **no test suite**. After logic changes, run `npm run typecheck`. For re
 
 Path alias: `@/*` → `src/*`. `package.json` name is leftover (`nextjs-postgresql-template`); ignore it.
 
-Fonts (Google, loaded in `layout.tsx`): Josefin Sans, Montserrat, Cinzel, Oswald, Share Tech Mono, Inter. Themes pick from those stacks.
+Fonts (Google, loaded in `layout.tsx`): Inter and Montserrat dress the DOM (`font-wf-ui` / `font-wf-display` / `.wf-wordmark`). Josefin Sans, Cinzel, Oswald, and Share Tech Mono are canvas dependencies — `themes.ts` names them as `labelFont` / `hudFont` and `drawing.ts` pre-warms them via `document.fonts`. Dropping a family changes exported video.
 
 ## Layout
 
@@ -61,32 +75,41 @@ Fonts (Google, loaded in `layout.tsx`): Josefin Sans, Montserrat, Cinzel, Oswald
 src/
   app/
     globals.css              Design tokens (`@theme`) + layout vars (`:root`)
-    page.tsx                 Workspace: rail (projects / new / assets / guide), project cards, import, delete
+    layout.tsx               Fonts + `bg-wf-bg` body
+    page.tsx                 Workspace home: header + rail panes
+                             (projects / templates / assets / guide)
     studio/[id]/page.tsx     Server page → client Studio
     api/projects/            GET list + seed, POST create
     api/projects/[id]/       GET / PUT / DELETE
     api/assets/              GET / POST / DELETE custom assets
     api/health/              `select 1` against Postgres
   components/studio/         Entire editor UI (client)
-    Studio.tsx               Document state, undo, autosave, keyboard, layout
+    Studio.tsx               Document state, undo, autosave, keyboard, shell layout
     MapView.tsx              Canvas preview, pan/zoom, region hit-test, paint
-    Panels.tsx               Left panel: layers tree / nations / assets / guide
-    MapProperties.tsx        Map + project settings (right panel, Map mode)
+    Panels.tsx               Left column: layers / nations / assets / guide
+    MapProperties.tsx        Map + project settings (Inspector Map mode)
     Timeline.tsx             Multi-track event editor
-    Inspector.tsx            Properties panel: Map | Event | Nation
-    ExportDialog.tsx         MP4 / WebM / PNG
-    FlagPreview.tsx          Canvas flag thumbnail (shared by both panels)
-    eventStyle.tsx           Per-EventType colour + icon (clips, badges)
-    ui.tsx                   Shared primitives — Button, Select, Segmented, Menu, …
-    chrome/                  Shell: Header, MenuBar, IconRail, SceneStrip,
-                             MapToolbar, ViewBar, StatusBar
+    Inspector.tsx            Right column: Map | Event | Nation
+    ExportDialog.tsx         MP4 / WebM / PNG modal
+    FlagPreview.tsx          Canvas flag thumbnail (Panels + Inspector)
+    eventStyle.tsx           Per-EventType hue + icon (clips, menus, badges)
+    ui.tsx                   Shared primitives for home + studio
+    chrome/
+      Header.tsx             Wordmark, rename, save-state, Preview / Export
+      MenuBar.tsx            File / Edit / View / Help
+      IconRail.tsx           Left-tab switcher + back to workspace
+      SceneStrip.tsx         Derived “Scene NN” chip (`activeChapter`)
+      MapToolbar.tsx         Tools, unit, keyframe, HUD, resolution
+      ViewBar.tsx            Tool hint, lat/lon, zoom
+      StatusBar.tsx          Save, year, projection, size, shortcuts
   lib/studio/                Domain logic — keep React out of here
     types.ts                 Canonical ProjectDoc (version: 1)
-    state.ts                 resolveState(t) — ownership, transfers, HUD
+    state.ts                 resolveState(t) — ownership, transfers, drawn fronts, HUD
     renderer.ts              Canvas2D MapRenderer
     export.ts                WebCodecs + MediaRecorder
     basemap.ts               Load + cull TopoJSON, region keys, hit-test
     projections.ts           13 projections + camera framing
+    frontline.ts             Drawn-front interpolate / captured-fill geometry
     drawing.ts               Flags, markers, noise used by frontlines
     themes.ts                MapTheme presets
     presets.ts               emptyProject, colours, flag presets, resolutions
@@ -161,6 +184,7 @@ Assigning a whole country (`c:IND`) and then transferring provinces (`pn:IND:Pun
 | --- | --- |
 | `camera` | Interpolates from the previous camera (or `map.defaultCamera`) across `[start, end]`. |
 | `territory` | Animates listed regions to `toNation`; commits ownership at `end`. |
+| `front` | Keyframed lon/lat polyline. Occupation fill is derived (not region-key ownership). Holds last shape after `end` unless `holdAfterEnd` is false. |
 | `nationChange` | Crossfades a nation's name / colour / flag / label. |
 | `disintegrate` | Splits `from` into `parts[]` (shatter staggers each part). Optional `dissolveRemainder`. |
 | `subtitle` | Lower/top/center title card. |
@@ -173,6 +197,8 @@ Assigning a whole country (`c:IND`) and then transferring provinces (`pn:IND:Pun
 `FrontMode` on territory: `auto` | `radial` | `linear` | `fade` | `instant` | `sweep-from-attacker`. `fromNation` + `origin` / `direction` steer the front. `roughness` (0–1) feeds `ringNoise` so the front is not a perfect circle. `showFrontline` defaults true.
 
 `instant` (or `end <= start`) applies ownership at `start` with no in-flight transfer.
+
+Drawn `front` events do **not** rewrite `ownership`. Pair them with a Territory/disintegrate commit when later clips need the political map to match. Coordinates stay `[lon, lat]`. Keyframe `offset` is seconds from `event.start`.
 
 ### Camera
 
@@ -192,12 +218,13 @@ Compositing (per viewport, including insets):
 
 1. Background / ocean, optional graticule.
 2. Land fill, nation fills (countries + leftover provinces), in-flight transfer masks.
-3. Cached line overlay: coast, lakes, rivers, railroads, province mesh, country mesh.
-4. Nation outlines, cities, labels.
-5. Frontline stroke on active transfers.
-6. Markers, map text.
-7. Editor overlay (preview only): selection, hover, crosshair.
-8. HUD: year, flags, subtitles. Vignette last.
+3. Drawn occupation fills (`front` events).
+4. Cached line overlay: coast, lakes, rivers, railroads, province mesh, country mesh.
+5. Nation outlines, cities, labels.
+6. Territory-transfer frontline stroke, then drawn-front stroke.
+7. Markers, map text.
+8. Editor overlay (preview only): selection, hover, crosshair, front handles.
+9. HUD: year, flags, subtitles. Vignette last.
 
 Viewport cache key: projection + rounded camera + size + precision + basemap lod/year. Changing those drops `Path2D` / line-canvas caches. Geometry far from the frame is culled with `partBoxes` / `cullGeometry` (disabled for azimuthal views and antimeridian-spanning frames).
 
@@ -209,6 +236,8 @@ Export is **client-side only**. Do not add a server encode path unless asked. MP
 
 `Studio` holds the live `ProjectDoc`, 80-deep undo (`past` / `future` refs), playhead, tool, selection (region keys), selected nation/event, and a `MapRenderer` instance.
 
+Chrome state (`leftTab`, `propsTab`, `leftOpen`, `rightOpen`, `collapsedTracks`, `lockedTracks`) is editor-local and **never persisted**. Selecting an event or nation also switches `propsTab` and opens the right panel in the same callback (not an effect), so the tab switch is one render.
+
 **Every document mutation** goes through `setProject(updater, record = true)`:
 
 ```ts
@@ -219,15 +248,56 @@ Pass `record = false` only for transient in-gesture updates that should not crea
 
 Autosave: when `saveState === "dirty"`, PUT `/api/projects/:id` with `{ data: project }` after **4 s**. Ctrl/Cmd+S saves immediately. PUT mirrors `data.name`, `data.description`, `data.duration` onto the row.
 
-Tools (`MapView`): `select` (click/drag-paint regions), `pan`, `marker` (click places a marker event), `pick` (one-shot lon/lat callback for inspector fields). Region mode is `country` | `province`. Shift-click adds to the selection set.
+Tools (`MapView`): `select` (click/drag-paint regions), `pan`, `marker` (click places a marker event), `front` (click vertices of a drawn frontline), `pick` (one-shot lon/lat callback for inspector fields). Region mode is `country` | `province`. Shift-click adds to the selection set.
 
-Keyboard (ignored while typing in inputs): Space play/pause, arrows ±0.5 s (Shift ±5 s), Home, Delete/Backspace selected event, Ctrl/Cmd+Z undo, Ctrl/Cmd+Shift+Z or Ctrl/Cmd+Y redo, Ctrl/Cmd+D duplicate event, Esc clear selection / cancel pick.
+Keyboard (ignored while typing in inputs): Space play/pause, arrows ±0.5 s (Shift ±5 s), Home, Delete/Backspace selected event (front tool: last draft vertex or selected handle), Enter finish front draft, Ctrl/Cmd+Z undo, Ctrl/Cmd+Shift+Z or Ctrl/Cmd+Y redo, Ctrl/Cmd+D duplicate event, Esc cancel front draft / clear selection / cancel pick / leave front tool.
 
-Studio chrome, outside in: `Header` → `MenuBar` → [`IconRail` | `Panels` | (`SceneStrip` → `MapToolbar` → `MapView` → `ViewBar`) + `Inspector`, with `Timeline` spanning the stage and the Inspector] → `StatusBar`. The rail and left panel run full height; the timeline does not. Shared controls live in `ui.tsx`; region sizes are `--wf-*` vars in `globals.css`.
+### Shell
 
-Panel split: **layers on the left, settings on the right.** `Panels` owns the layer tree (all 15 `LayerId`s, grouped) and the nations/assets/guide tabs; map and project settings live in `MapProperties`, rendered by the Inspector's Map mode. Both call the same `onUpdateMap` / `onUpdateProject`.
+Outside in:
 
-`SceneStrip`'s "Scene 04" chip and the map-stage caption are **derived**, not stored — `activeChapter(project, t)` reads the `year` and `subtitle` events. There is no scenes model in `ProjectDoc`. Likewise per-track collapse/lock in the timeline are editor-local state, never render flags, so they cannot desync preview from export.
+```
+Header
+MenuBar
+[ IconRail | Panels? | ( SceneStrip → MapToolbar → MapView → ViewBar ) + Inspector? ]
+  Timeline   ← spans stage + Inspector; does NOT span the rail or left panel
+StatusBar
+ExportDialog (modal)
+```
+
+The rail and left panel run full height; the timeline does not. Region sizes are `--wf-*` vars in `globals.css` (`--wf-h-header` 64px, `--wf-h-menubar` 32px, `--wf-w-rail` 64px, `--wf-w-left` 248px, `--wf-h-scene` 34px, `--wf-h-toolbar` 42px, `--wf-h-viewbar` 32px, `--wf-w-right` 296px, `--wf-h-timeline` 244px, `--wf-h-status` 26px). Timeline row geometry (`LANE_H` / `CLIP_H` / `RULER_H`) lives in `Timeline.tsx` because it feeds JS layout maths — do not declare it twice.
+
+| Piece | Role |
+| --- | --- |
+| `Header` | `Wordmark`, inline rename, `SaveState` (saved / dirty / saving / error), undo / redo / save, Preview, Export. Home reuses `Wordmark`. |
+| `MenuBar` | File / Edit / View / Help. Every item calls an existing Studio handler; shortcuts shown are the live keydown bindings, not new ones. |
+| `IconRail` | Switches `LeftTab`: `layers` / `nations` / `assets` / `help`. Clicking a tab also opens the left panel. Back-to-workspace link at the bottom. |
+| `Panels` | Left column. Layers tree (all 15 `LayerId`s in `LAYER_GROUPS`), nations list, assets (flag presets / uploads / markers / colours), field guide. A project card at the top of Layers opens Map properties. |
+| `SceneStrip` | Derived “Scene NN · title” from `activeChapter(project, t)` — latest `year` numbers the chapter; the `subtitle` active at `t` (else the year text) titles it. Jump menu + add-year. **No scenes model** in `ProjectDoc`. |
+| `MapToolbar` | Tools (select / pan / marker / front), unit (country / province), set-keyframe, HUD toggle, output resolution. |
+| `MapView` | Canvas preview. Stage corner overlays (name, size/duration, caption, cursor) sit on the **surround**, never on the canvas, so they cannot be mistaken for video. |
+| `ViewBar` | Tool hint, free-camera chip, lat/lon, zoom ±. |
+| `Inspector` | Right column. `PropsTab`: `map` / `event` / `nation`. Map mode renders `MapProperties`. A painted-region selection block sits above the mode switch. |
+| `MapProperties` | Project title/description, border year, projection, LOD, theme, output size, default camera. Settings, not visibility switches. |
+| `Timeline` | Multi-track clips in `TRACK_ORDER`. Collapse / lock are editor-local. `+` menu adds at the playhead. Snap ¼ s, pps zoom. Clip colours come from `eventStyle.tsx`. |
+| `StatusBar` | Save, border year, projection, basemap load, description, output size, shortcuts. |
+| `ExportDialog` | MP4 / WebM / PNG snapshot. Escape closes unless a render is in progress. |
+
+Panel split: **layers on the left, settings on the right.** `Panels` owns visibility switches; `MapProperties` owns configuration. Both call the same `onUpdateMap` / `onUpdateProject`. `FlagPreview` is the shared canvas flag thumbnail — do not import it from Inspector into Panels.
+
+`SceneStrip`'s chip and the map-stage caption must stay the same derivation (`activeChapter`). Per-track collapse/lock never become render flags, so they cannot desync preview from export.
+
+### Workspace (home)
+
+`src/app/page.tsx` is a four-pane workspace (`projects` / `templates` / `assets` / `guide`) with the same 64px header, 64px rail, and 26px status bar as the studio. It imports `Wordmark` from `chrome/Header` and primitives from `ui.tsx`. Delete uses an in-card confirm, not `window.confirm`. New templates get a card in `TemplatesPane` (and the projects-pane New menu) plus the POST `template` id.
+
+### Shared primitives (`ui.tsx`)
+
+Home and studio compose from this file. Do not introduce a second design system or a second accent hue. Icons are `lucide-react` at `strokeWidth={1.75}` unless a heavier glyph is needed.
+
+Load-bearing exports (keep names and signatures): `Field`, `TextInput`, `TextArea`, `NumberInput`, `Select`, `ColorInput`, `Toggle`, `Checkbox`, `Slider`, `Button`, `IconButton`, `Segmented`, `Tabs`, `Card`, `PanelHeader`, `GroupHeader`, `ListRow`, `Section`, `Chip`, `Badge`, `Pill`, `Kbd`, `Divider`, `StatusDot`, `SearchInput`, `EmptyState`, `Menu` / `MenuItem` / `MenuLabel` / `MenuSeparator`. `Button` `primary` is an alias of `accent`.
+
+Stage overlays and chrome captions are DOM. Video pixels come only from `MapRenderer`.
 
 ## Persistence
 
@@ -264,7 +334,7 @@ ISO flags live in `public/flags/{CODE}.svg`. `FlagSpec.kind === "iso"` loads `/f
 
 ## Templates and presets
 
-`greatAsianWarTemplate()` in `src/lib/studio/template.ts` is the feature tour (2022–2034, 120 s, neon-noir, present borders). Helpers at the top (`nation`, `year`, `cam`, `sub`, `terr`, `marker`, `change`) are the preferred way to add template content. Reset `counter = 0` at the start of the factory so ids are stable.
+`greatAsianWarTemplate()` in `src/lib/studio/template.ts` is the feature tour (2022–2034, 120 s, neon-noir, present borders). Helpers at the top (`nation`, `year`, `cam`, `sub`, `terr`, `front`, `marker`, `change`) are the preferred way to add template content. Reset `counter = 0` at the start of the factory so ids are stable.
 
 When adding a user-visible capability, **show it in the template**.
 
@@ -280,9 +350,10 @@ Flag / colour presets in `presets.ts` include historical empires and the Great A
 - Functional components + hooks. Studio files are `"use client"`.
 - Server routes stay tiny: seed, drizzle, JSON. No rendering on the server.
 - Match surrounding style: 2-space indent, semicolons, early returns, small helpers next to the call site.
-- Style comes from the tokens in `globals.css`, never raw Tailwind palette colours: surfaces `bg-wf-bg` / `bg-wf-surface` / `bg-wf-raised` / `bg-wf-lane`, borders `border-wf-line`, text ramp `text-wf-text` → `text-wf-text-5`, the single accent `wf-accent` (+ `-hi` / `-ink` / `-soft` / `-mid` / `-text`), type `text-wf-xs` → `text-wf-xl`, radii `rounded-wf-sm/md/lg/xl`. Compose from `ui.tsx`; do not introduce a second design system, and do not add a second accent hue.
+- Style comes from the tokens in `globals.css`, never raw Tailwind palette colours: surfaces `bg-wf-bg` / `bg-wf-surface` / `bg-wf-raised` / `bg-wf-lane` / `bg-wf-void` / `bg-wf-stage` / `bg-wf-band`, borders `border-wf-line` / `border-wf-line-soft` / `border-wf-line-warm`, text ramp `text-wf-text` → `text-wf-text-5`, the single accent `wf-accent` (+ `-hi` / `-ink` / `-soft` / `-mid` / `-text`), status `wf-ok` / `wf-warn` / `wf-danger`, type `text-wf-xs` → `text-wf-xl`, radii `rounded-wf-sm/md/lg/xl`. Compose from `ui.tsx`; do not introduce a second design system, and do not add a second accent hue.
 - Every interactive element gets `wf-focus` (keyboard-only focus ring) and numeric readouts get `tnum`.
 - Canvas colours are separate on purpose: `themes.ts` drives the video, `globals.css` drives the DOM. Never wire one to the other.
+- Do not persist chrome (open panels, selected tabs, track collapse/lock, timeline zoom). Those are editor-local.
 - Comments only for non-obvious constraints (region-key aliases, transfer commit timing, camera scale normalization, cache keys).
 - New user-facing map behaviour belongs in `MapRenderer` so export matches preview.
 - New `ProjectDoc` fields: add to `types.ts`, default in `emptyProject` + `greatAsianWarTemplate`, inspector/panels if editable, renderer if visible. Bump `version` only with an explicit migrator.
@@ -303,25 +374,28 @@ Flag / colour presets in `presets.ts` include historical empires and the Great A
 ## Common changes
 
 **New template (e.g. WWII)**  
-Add `src/lib/studio/<name>.ts` exporting `createXTemplate(): ProjectDoc`. Wire `POST /api/projects` `template` and the home-page button. Reuse colours/flags in `presets.ts`. Prefer `pn:` / `cn:` keys.
+Add `src/lib/studio/<name>.ts` exporting `createXTemplate(): ProjectDoc`. Wire `POST /api/projects` `template`, a card in `TemplatesPane`, and the New menu on the projects pane (`src/app/page.tsx`). Reuse colours/flags in `presets.ts`. Prefer `pn:` / `cn:` keys.
 
 **New projection**  
 Add the id to `ProjectionId` and `PROJECTIONS`. Implement construction in `createProjection`. Extend `isAzimuthal` / `applyCamera` if it is not a standard cylindrical.
 
 **New marker kind**  
-Add to `MarkerKind`, `MARKER_KINDS`, and `drawMarker` in `drawing.ts`.
+Add to `MarkerKind`, `MARKER_KINDS`, and `drawMarker` in `drawing.ts`. The map-toolbar picker and the Assets panel grid read `MARKER_KINDS` automatically.
 
 **New theme**  
 Push a `MapTheme` onto `THEMES`. Id is what `map.theme` stores.
 
 **New overlay / HUD widget**  
-New event type in `types.ts` (add to the union, `EVENT_TYPE_LABELS`, `TRACK_ORDER`), handle in `resolveState`, draw in `renderHud` / `renderScene`, factory in `Studio.addEvent`, fields in `Inspector`.
+New event type in `types.ts` (add to the union, `EVENT_TYPE_LABELS`, `TRACK_ORDER`), a hue + icon in `eventStyle.tsx` (`EVENT_COLOR` + `ICONS`), handle in `resolveState`, draw in `renderHud` / `renderScene`, factory in `Studio.addEvent`, fields in `Inspector`.
+
+**Drawn frontline**  
+`FrontEvent` in `types.ts`, geometry in `frontline.ts`, `ActiveFront` in `resolveState`, fill+stroke in `MapRenderer` (export shares this path). Do not resurrect occupation polygons. Pair visual fronts with Territory commits in templates. Show the capability in `greatAsianWarTemplate()`.
 
 **New border year**  
 Add to `BorderYear` + `BORDER_YEARS`. Add a `HIST_YEARS` row in `build-basemap.mjs` (or alias an existing snapshot like 1935/1939) and rebuild.
 
 **New layer**  
-Add to `LayerId`, `ALL_LAYERS`, `LAYER_LABELS`, `defaultLayers()`, load in `loadBasemap`, draw behind a `map.layers.*` flag in the renderer.
+Add to `LayerId`, `ALL_LAYERS`, `LAYER_LABELS`, `defaultLayers()`, a group + icon in `LAYER_GROUPS` / `LAYER_ICONS` (`Panels.tsx` — otherwise it has no switch), load in `loadBasemap`, draw behind a `map.layers.*` flag in the renderer. The layers-panel “N/15 on” badge is the length of `ALL_LAYERS`; keep it in sync.
 
 **Autosave / API shape**  
 PUT body is `{ data: ProjectDoc, name?, thumbnail? }`. `data` drives name/description/duration. Keep that.
@@ -334,3 +408,13 @@ PUT body is `{ data: ProjectDoc, name?, thumbnail? }`. `data` drives name/descri
 - Editing committed files under `public/basemap/` by hand.
 - Reintroducing the file-repo / Zustand store / zone-polygon document model.
 - Renaming the leftover `nextjs-postgresql-template` package name in a drive-by change.
+
+## After a code task
+
+Coding agents must run this before stopping:
+
+```bash
+codegraph sync
+```
+
+That command updates the local Codegraph index so later sessions see the files you just changed. Skip it only if the task made no file edits.

@@ -1,14 +1,15 @@
 "use client";
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import type { GeoProjection } from "d3-geo";
-import type { MapRenderer } from "@/lib/studio/renderer";
+import type { FrontEditOverlay, MapRenderer } from "@/lib/studio/renderer";
 import type { Basemap, RegionFeature } from "@/lib/studio/basemap";
 import { hitTest, regionName } from "@/lib/studio/basemap";
 import type { Camera, ProjectDoc } from "@/lib/studio/types";
 import { createProjection, applyCamera } from "@/lib/studio/projections";
 import { preloadFonts, preloadFlags } from "@/lib/studio/drawing";
+import { distPointToSegment } from "@/lib/studio/frontline";
 
-export type Tool = "select" | "pan" | "marker" | "pick";
+export type Tool = "select" | "pan" | "marker" | "pick" | "front";
 
 export interface MapViewProps {
   renderer: MapRenderer;
@@ -27,10 +28,18 @@ export interface MapViewProps {
   showHud: boolean;
   /** Chapter title for the bottom-left stage overlay (derived, see SceneStrip). */
   caption?: string;
+  frontEdit?: FrontEditOverlay | null;
+  onFrontAddVertex?: (ll: [number, number]) => void;
+  onFrontFinish?: () => void;
+  onFrontClose?: () => void;
+  onFrontMoveHandle?: (index: number, ll: [number, number], record: boolean) => void;
+  onFrontInsertHandle?: (index: number, ll: [number, number]) => void;
+  onFrontSelectHandle?: (index: number | null) => void;
+  onFrontPickCaptured?: (ll: [number, number]) => void;
 }
 
 export default function MapView(props: MapViewProps) {
-  const { renderer, project, basemap, time, viewCamera, selection, tool, regionMode, renderVersion, showHud } = props;
+  const { renderer, project, basemap, time, viewCamera, selection, tool, regionMode, renderVersion, showHud, frontEdit } = props;
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const [hover, setHover] = useState<string | null>(null);
   const [cursorInfo, setCursorInfo] = useState<string>("");
@@ -42,14 +51,16 @@ export default function MapView(props: MapViewProps) {
     moved: boolean;
     paint: boolean;
     button: number;
+    handle: number | null;
   } | null>(null);
+  const lastFrontClick = useRef(0);
   const W = project.map.width;
   const H = project.map.height;
 
   // ------------------------------------------------------------ render loop (coalesced)
   const pending = useRef(false);
-  const latest = useRef({ time, viewCamera, selection, hover, showHud, crosshair: props.crosshair });
-  latest.current = { time, viewCamera, selection, hover, showHud, crosshair: props.crosshair };
+  const latest = useRef({ time, viewCamera, selection, hover, showHud, crosshair: props.crosshair, frontEdit });
+  latest.current = { time, viewCamera, selection, hover, showHud, crosshair: props.crosshair, frontEdit };
   const draw = useCallback(() => {
     if (pending.current) return;
     pending.current = true;
@@ -68,6 +79,7 @@ export default function MapView(props: MapViewProps) {
           editorOverlay: true,
           showHud: l.showHud,
           crosshair: l.crosshair ?? null,
+          frontEdit: l.frontEdit ?? null,
         });
       } catch (e) {
         console.error("render error", e);
@@ -77,7 +89,7 @@ export default function MapView(props: MapViewProps) {
 
   useEffect(() => {
     draw();
-  }, [draw, project, time, viewCamera, selection, hover, basemap, renderVersion, showHud, props.crosshair]);
+  }, [draw, project, time, viewCamera, selection, hover, basemap, renderVersion, showHud, props.crosshair, frontEdit]);
 
   useEffect(() => {
     renderer.onNeedsRedraw = draw;
@@ -119,13 +131,53 @@ export default function MapView(props: MapViewProps) {
     return { ll, region: hitTest(basemap, ll[0], ll[1], regionMode) };
   };
 
+  const hitFrontHandle = (x: number, y: number): number | null => {
+    const handles = frontEdit?.handles;
+    const proj = renderer.projection;
+    if (!handles?.length || !proj) return null;
+    let best = -1;
+    let bestD = 12;
+    handles.forEach((h, i) => {
+      const p = proj(h);
+      if (!p) return;
+      const d = Math.hypot(p[0] - x, p[1] - y);
+      if (d < bestD) {
+        bestD = d;
+        best = i;
+      }
+    });
+    return best >= 0 ? best : null;
+  };
+
+  const hitFrontSegment = (x: number, y: number): { index: number; ll: [number, number] } | null => {
+    const handles = frontEdit?.handles;
+    const proj = renderer.projection;
+    if (!handles || handles.length < 2 || !proj) return null;
+    const n = handles.length;
+    const closed = !!frontEdit?.closed;
+    const segs = closed ? n : n - 1;
+    let best: { index: number; dist: number; closest: [number, number] } | null = null;
+    for (let i = 0; i < segs; i++) {
+      const a = proj(handles[i]);
+      const b = proj(handles[(i + 1) % n]);
+      if (!a || !b) continue;
+      const hit = distPointToSegment([x, y], [a[0], a[1]], [b[0], b[1]]);
+      if (hit.dist < 8 && (!best || hit.dist < best.dist)) best = { index: i + 1, dist: hit.dist, closest: hit.closest };
+    }
+    if (!best) return null;
+    const ll = renderer.screenToLonLat(best.closest[0], best.closest[1]);
+    return ll ? { index: best.index, ll } : null;
+  };
+
   // ------------------------------------------------------------ pointer events
   const onPointerDown = (e: React.PointerEvent) => {
     const [x, y] = toCanvas(e);
     const cam = currentCamera();
     const proj = applyCamera(createProjection(project.map.projection), project.map.projection, cam, W, H, project.map.precision ?? 0.7);
     const paint = tool === "select" && e.shiftKey && e.button === 0;
-    drag.current = { x, y, cam, proj, moved: false, paint, button: e.button };
+    let handle: number | null = null;
+    if (tool === "front" && e.button === 0) handle = hitFrontHandle(x, y);
+    drag.current = { x, y, cam, proj, moved: false, paint, button: e.button, handle };
     (e.target as HTMLElement).setPointerCapture(e.pointerId);
     if (paint) {
       const { region } = regionAt(x, y);
@@ -135,6 +187,7 @@ export default function MapView(props: MapViewProps) {
         props.onSelectionChange(next);
       }
     }
+    if (handle != null) props.onFrontSelectHandle?.(handle);
   };
 
   const lastHover = useRef(0);
@@ -154,6 +207,12 @@ export default function MapView(props: MapViewProps) {
         }
         return;
       }
+      if (d.handle != null && d.moved) {
+        const ll = renderer.screenToLonLat(x, y);
+        if (ll) props.onFrontMoveHandle?.(d.handle, [+ll[0].toFixed(4), +ll[1].toFixed(4)], false);
+        return;
+      }
+      if (tool === "front" && (frontEdit?.draft || d.handle != null)) return;
       if (!d.moved) return;
       // pan: the point that was under the center should move by (dx, dy)
       const inv = d.proj.invert?.([W / 2 - dx, H / 2 - dy]);
@@ -166,8 +225,8 @@ export default function MapView(props: MapViewProps) {
     if (now - lastHover.current < 40) return;
     lastHover.current = now;
     const { ll, region } = regionAt(x, y);
-    setHover(region ? region.id : null);
-    setCursorInfo(ll ? `${ll[1].toFixed(2)}°, ${ll[0].toFixed(2)}°${region ? ` · ${regionName(basemap, region.id)}` : ""}` : "");
+    setHover(tool === "front" ? null : region ? region.id : null);
+    setCursorInfo(ll ? `${ll[1].toFixed(2)}°, ${ll[0].toFixed(2)}°${region && tool !== "front" ? ` · ${regionName(basemap, region.id)}` : ""}` : "");
   };
 
   const onPointerUp = (e: React.PointerEvent) => {
@@ -175,9 +234,51 @@ export default function MapView(props: MapViewProps) {
     drag.current = null;
     if (!d) return;
     const [x, y] = toCanvas(e);
+    if (d.handle != null) {
+      if (d.moved) {
+        const ll = renderer.screenToLonLat(x, y);
+        if (ll) props.onFrontMoveHandle?.(d.handle, [+ll[0].toFixed(4), +ll[1].toFixed(4)], true);
+      }
+      return;
+    }
     if (d.moved || d.paint) return;
     if (d.button !== 0) return;
     const { ll, region } = regionAt(x, y);
+    if (tool === "front") {
+      if (!ll) return;
+      const now = performance.now();
+      const dbl = now - lastFrontClick.current < 320;
+      lastFrontClick.current = now;
+      if (dbl && (frontEdit?.draft || (frontEdit?.handles.length ?? 0) >= 2)) {
+        props.onFrontFinish?.();
+        return;
+      }
+      if (frontEdit?.draft && frontEdit.handles.length >= 3) {
+        const first = renderer.projection?.(frontEdit.handles[0]);
+        if (first && Math.hypot(first[0] - x, first[1] - y) < 14) {
+          props.onFrontClose?.();
+          return;
+        }
+      }
+      if (!frontEdit?.draft) {
+        const handle = hitFrontHandle(x, y);
+        if (handle != null) {
+          props.onFrontSelectHandle?.(handle);
+          return;
+        }
+        const seg = hitFrontSegment(x, y);
+        if (seg) {
+          props.onFrontInsertHandle?.(seg.index, [+seg.ll[0].toFixed(4), +seg.ll[1].toFixed(4)]);
+          return;
+        }
+        if (frontEdit?.pickCaptured && frontEdit.handles.length >= 2 && !frontEdit.draft) {
+          props.onFrontPickCaptured?.([+ll[0].toFixed(4), +ll[1].toFixed(4)]);
+          return;
+        }
+      }
+      props.onFrontAddVertex?.([+ll[0].toFixed(4), +ll[1].toFixed(4)]);
+      return;
+    }
     if (tool === "select") {
       if (!region) {
         if (!e.ctrlKey && !e.metaKey) props.onSelectionChange(new Set());
@@ -221,7 +322,7 @@ export default function MapView(props: MapViewProps) {
     return () => c.removeEventListener("wheel", h);
   }, []);
 
-  const cursor = tool === "pan" ? "grab" : tool === "marker" || tool === "pick" ? "crosshair" : "default";
+  const cursor = tool === "pan" ? "grab" : tool === "marker" || tool === "pick" || tool === "front" ? "crosshair" : "default";
 
   return (
     <div className="relative flex h-full w-full items-center justify-center overflow-hidden bg-wf-void p-4">

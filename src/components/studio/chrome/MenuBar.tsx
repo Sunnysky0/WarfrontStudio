@@ -14,6 +14,7 @@ import {
   Keyboard,
   MapPin,
   MousePointer2,
+  Spline,
   PanelLeft,
   PanelRight,
   Redo2,
@@ -118,6 +119,9 @@ export default function MenuBar(props: MenuBarProps) {
         </MenuItem>
         <MenuItem icon={<MapPin size={12} strokeWidth={1.75} />} checked={props.tool === "marker"} onClick={() => props.onTool("marker")}>
           Place marker
+        </MenuItem>
+        <MenuItem icon={<Spline size={12} strokeWidth={1.75} />} checked={props.tool === "front"} onClick={() => props.onTool("front")}>
+          Draw frontline
         </MenuItem>
         <MenuSeparator />
         <MenuLabel>Selection unit</MenuLabel>

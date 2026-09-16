@@ -47,6 +47,8 @@ function eventTitle(e: StudioEvent): string {
       return e.text;
     case "territory":
       return e.label ?? `→ ${e.toNation} (${e.regions.length})`;
+    case "front":
+      return e.label ?? `front ${e.nation} (${e.keyframes.length} kf)`;
     case "disintegrate":
       return e.label ?? `${e.from} splits ×${e.parts.length}`;
     case "nationChange":

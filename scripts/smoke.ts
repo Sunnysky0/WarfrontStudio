@@ -6,7 +6,7 @@ g.fetch = async (url: string) => {
   if (!fs.existsSync(p)) return { ok: false, status: 404, json: async () => ({}) };
   return { ok: true, status: 200, json: async () => JSON.parse(fs.readFileSync(p, "utf8")) };
 };
-class Path2DStub { moveTo() {} lineTo() {} arc() {} closePath() {} rect() {} roundRect() {} bezierCurveTo() {} quadraticCurveTo() {} }
+class Path2DStub { moveTo() {} lineTo() {} arc() {} closePath() {} rect() {} roundRect() {} bezierCurveTo() {} quadraticCurveTo() {} addPath() {} }
 g.Path2D = Path2DStub;
 let calls = 0;
 const ctxStub: any = new Proxy({}, {
@@ -63,7 +63,7 @@ async function main() {
     const t0 = Date.now();
     r.render(ctxStub, 1920, 1080, t, { showHud: true, editorOverlay: true, selection: new Set(["c:JPN", "pn:TWN:Pingtung"]), hover: "c:IND" });
     const owners = new Set(st.ownership.values());
-    console.log(`t=${t}s year=${st.year} cam=${st.camera.lon.toFixed(1)},${st.camera.lat.toFixed(1)}x${st.camera.scale.toFixed(0)} nations=${owners.size} transfers=${st.transfers.length} markers=${st.markers.length} subs=${st.subtitles.length} insets=${st.insets.length} prc=${st.nations.get("prc")?.name}/${st.nations.get("prc")?.color} pak=${st.nations.get("pak")?.name} ${Date.now() - t0}ms`);
+    console.log(`t=${t}s year=${st.year} cam=${st.camera.lon.toFixed(1)},${st.camera.lat.toFixed(1)}x${st.camera.scale.toFixed(0)} nations=${owners.size} transfers=${st.transfers.length} fronts=${st.fronts.length} markers=${st.markers.length} subs=${st.subtitles.length} insets=${st.insets.length} prc=${st.nations.get("prc")?.name}/${st.nations.get("prc")?.color} pak=${st.nations.get("pak")?.name} ${Date.now() - t0}ms`);
   }
   // other projections & themes
   for (const proj of ["orthographic", "robinson", "conicConformal", "satellite", "winkel3"] as const) {

@@ -3,12 +3,24 @@ import type { MultiPolygon, Polygon } from "geojson";
 import type { Basemap } from "./basemap";
 import { mergeRegions, resolveRegionKey, cullGeometry, type GeoBBox } from "./basemap";
 import { createProjection, applyCamera, isAzimuthal, scaleToZoom } from "./projections";
-import { resolveState, type ResolvedState, type ActiveTransfer, type NationState, mixColor, withAlpha, clamp, ease } from "./state";
+import { resolveState, type ResolvedState, type ActiveTransfer, type ActiveFront, type NationState, mixColor, withAlpha, clamp, ease } from "./state";
 import type { Camera, MapTheme, ProjectDoc, InsetEvent } from "./types";
 import { drawFlag, drawMarker, ringNoise, noise1 } from "./drawing";
+import { capturedFillRing, polylineScreenBBox, type Pt } from "./frontline";
 import { getTheme } from "./themes";
 
 type Ctx = CanvasRenderingContext2D;
+
+export interface FrontEditOverlay {
+  handles: [number, number][];
+  line?: [number, number][];
+  closed?: boolean;
+  selectedHandle?: number | null;
+  capturedSide?: [number, number] | null;
+  draft?: boolean;
+  /** Empty-map click sets captured-side instead of starting a new draft. */
+  pickCaptured?: boolean;
+}
 
 export interface RenderOptions {
   cameraOverride?: Camera;
@@ -19,6 +31,7 @@ export interface RenderOptions {
   state?: ResolvedState;
   /** show a crosshair at a lon/lat (used while picking points) */
   crosshair?: [number, number] | null;
+  frontEdit?: FrontEditOverlay | null;
 }
 
 interface Anchor {
@@ -56,6 +69,7 @@ class Viewport {
   nationFills = new Map<string, NationFillCache>();
   transfers = new Map<string, TransferCache>();
   regionPaths = new Map<string, Path2D>();
+  frontRegionClips = new Map<string, Path2D>();
   countryAnchors: Map<string, Anchor | null> | null = null;
   bbox: GeoBBox | null = null;
   clipAngleRad = Math.PI;
@@ -68,6 +82,7 @@ class Viewport {
     this.nationFills.clear();
     this.transfers.clear();
     this.regionPaths.clear();
+    this.frontRegionClips.clear();
   }
 }
 
@@ -306,6 +321,9 @@ export class MapRenderer {
     // active transfers (frontlines)
     for (const tr of state.transfers) this.renderTransfer(ctx, vp, W, H, camera, state, tr, fills, k);
 
+    // drawn occupation fills (after transfers so a drawn front wins where they overlap)
+    for (const fr of state.fronts) this.renderFront(ctx, vp, W, H, camera, state, fr, fills, k, "fill");
+
     // cached line layers
     this.renderLines(ctx, vp, W, H, k);
 
@@ -319,6 +337,8 @@ export class MapRenderer {
         if (f.pPath) ctx.stroke(f.pPath);
       }
     }
+
+    for (const fr of state.fronts) this.renderFront(ctx, vp, W, H, camera, state, fr, fills, k, "stroke");
 
     // editor overlays (selection / hover)
     if (opts.editorOverlay && !isInset) this.renderSelection(ctx, vp, opts);
@@ -375,6 +395,8 @@ export class MapRenderer {
         ctx.stroke();
       }
     }
+
+    if (opts.editorOverlay && !isInset && opts.frontEdit) this.renderFrontEdit(ctx, vp, camera, W, H, k, opts.frontEdit);
   }
 
   private setLetterSpacing(ctx: Ctx, px: number) {
@@ -608,6 +630,185 @@ export class MapRenderer {
     }
     ctx.restore();
     void W;
+    void H;
+  }
+
+  // ------------------------------------------------------------------ drawn fronts
+  private projectFront(vp: Viewport, camera: Camera, pts: [number, number][]): Pt[] {
+    const out: Pt[] = [];
+    if (!vp.proj) return out;
+    for (const [lon, lat] of pts) {
+      if (!this.visible(vp, camera, lon, lat)) continue;
+      const s = vp.proj([lon, lat]);
+      if (s && Number.isFinite(s[0]) && Number.isFinite(s[1])) out.push([s[0], s[1]]);
+    }
+    return out;
+  }
+
+  private roughenLine(pts: Pt[], roughness: number, seed: number, k: number, closed: boolean): Pt[] {
+    if (roughness <= 0 || pts.length < 3) return pts;
+    return pts.map((p, i) => {
+      const prev = pts[closed ? (i - 1 + pts.length) % pts.length : Math.max(0, i - 1)];
+      const next = pts[closed ? (i + 1) % pts.length : Math.min(pts.length - 1, i + 1)];
+      const tx = next[0] - prev[0];
+      const ty = next[1] - prev[1];
+      const len = Math.hypot(tx, ty) || 1;
+      const n = noise1(i * 0.22 + seed * 10, seed);
+      const amp = roughness * (7 * k + 0.035 * len);
+      return [p[0] + (-ty / len) * amp * n, p[1] + (tx / len) * amp * n] as Pt;
+    });
+  }
+
+  private frontTheaterPath(vp: Viewport, fr: ActiveFront, fills: Map<string, NationFillCache>): Path2D | null {
+    if (fr.theater === "regions" && fr.clipRegions?.length) {
+      const bm = this.basemap;
+      if (!bm) return null;
+      const sig = fr.clipRegions.join(",");
+      let p = vp.frontRegionClips.get(sig);
+      if (!p) {
+        const merged = mergeRegions(bm, fr.clipRegions);
+        p = new Path2D();
+        const path = vp.path!;
+        path.context(p as unknown as GeoContext);
+        if (merged.countries) path(merged.countries);
+        if (merged.provinces) path(merged.provinces);
+        path.context(null);
+        vp.frontRegionClips.set(sig, p);
+      }
+      return p;
+    }
+    if (fr.theater === "sides") {
+      const p = new Path2D();
+      let any = false;
+      for (const id of [fr.nation, fr.against]) {
+        if (!id) continue;
+        const f = fills.get(id);
+        if (!f) continue;
+        if (f.cPath) {
+          p.addPath(f.cPath);
+          any = true;
+        }
+        if (f.pPath) {
+          p.addPath(f.pPath);
+          any = true;
+        }
+      }
+      return any ? p : null;
+    }
+    return null;
+  }
+
+  private renderFront(
+    ctx: Ctx,
+    vp: Viewport,
+    W: number,
+    H: number,
+    camera: Camera,
+    state: ResolvedState,
+    fr: ActiveFront,
+    fills: Map<string, NationFillCache>,
+    k: number,
+    phase: "fill" | "stroke"
+  ) {
+    const th = this.theme;
+    let line = this.projectFront(vp, camera, fr.points);
+    if (line.length < 2) return;
+    line = this.roughenLine(line, fr.roughness, fr.seed, k, fr.closed);
+    const theater = this.frontTheaterPath(vp, fr, fills);
+    const ns = state.nations.get(fr.nation);
+    const color = ns ? (th.fillDesaturate ? mixColor(ns.color, th.land, th.fillDesaturate) : ns.color) : th.land;
+
+    ctx.save();
+    if (vp.landPath) ctx.clip(vp.landPath);
+    if (theater) ctx.clip(theater);
+    else if (fr.theater === "land") {
+      const pad = Math.max(120 * k, 0.12 * Math.min(W, H));
+      const bb = polylineScreenBBox(line, pad);
+      if (bb) {
+        const box = new Path2D();
+        box.rect(bb.x0, bb.y0, bb.x1 - bb.x0, bb.y1 - bb.y0);
+        ctx.clip(box);
+      }
+    }
+
+    if (phase === "fill" && fr.fillOccupation) {
+      const cap = vp.proj ? vp.proj(fr.capturedSide) : null;
+      const captured: Pt =
+        cap && Number.isFinite(cap[0]) && Number.isFinite(cap[1])
+          ? [cap[0], cap[1]]
+          : [line[Math.floor(line.length / 2)][0], line[Math.floor(line.length / 2)][1]];
+      const pad = Math.max(W, H);
+      const ring = capturedFillRing(line, captured, { x0: -pad, y0: -pad, x1: W + pad, y1: H + pad }, fr.closed);
+      if (ring && ring.length >= 3) {
+        const path = new Path2D();
+        path.moveTo(ring[0][0], ring[0][1]);
+        for (let i = 1; i < ring.length; i++) path.lineTo(ring[i][0], ring[i][1]);
+        path.closePath();
+        ctx.fillStyle = color;
+        ctx.fill(path);
+      }
+    }
+
+    if (phase === "stroke" && fr.showFrontline) {
+      ctx.lineJoin = "round";
+      ctx.lineCap = "round";
+      ctx.lineWidth = 2.4 * k;
+      ctx.strokeStyle = th.frontline;
+      ctx.shadowColor = th.frontlineGlow ?? th.frontline;
+      ctx.shadowBlur = 14 * k;
+      ctx.beginPath();
+      ctx.moveTo(line[0][0], line[0][1]);
+      for (let i = 1; i < line.length; i++) ctx.lineTo(line[i][0], line[i][1]);
+      if (fr.closed) ctx.closePath();
+      ctx.stroke();
+      ctx.shadowBlur = 0;
+    }
+    ctx.restore();
+  }
+
+  private renderFrontEdit(ctx: Ctx, vp: Viewport, camera: Camera, W: number, H: number, k: number, edit: FrontEditOverlay) {
+    const th = this.theme;
+    const line = edit.line?.length ? this.projectFront(vp, camera, edit.line) : this.projectFront(vp, camera, edit.handles);
+    ctx.save();
+    if (line.length >= 2) {
+      ctx.strokeStyle = edit.draft ? th.hudAccent : "#ffffff";
+      ctx.globalAlpha = 0.85;
+      ctx.lineWidth = 1.6 * k;
+      ctx.setLineDash(edit.draft ? [6 * k, 4 * k] : []);
+      ctx.beginPath();
+      ctx.moveTo(line[0][0], line[0][1]);
+      for (let i = 1; i < line.length; i++) ctx.lineTo(line[i][0], line[i][1]);
+      if (edit.closed) ctx.closePath();
+      ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.globalAlpha = 1;
+    }
+    const r = Math.max(4, 5.5 * k);
+    edit.handles.forEach((h, i) => {
+      const p = this.toScreen(vp, camera, h[0], h[1], W, H, 40);
+      if (!p) return;
+      ctx.beginPath();
+      ctx.arc(p[0], p[1], r, 0, Math.PI * 2);
+      ctx.fillStyle = i === edit.selectedHandle ? th.hudAccent : "#141814";
+      ctx.fill();
+      ctx.strokeStyle = i === edit.selectedHandle ? "#fff" : th.hudAccent;
+      ctx.lineWidth = 1.4;
+      ctx.stroke();
+    });
+    if (edit.capturedSide && !edit.closed) {
+      const p = this.toScreen(vp, camera, edit.capturedSide[0], edit.capturedSide[1], W, H, 40);
+      if (p) {
+        ctx.strokeStyle = th.hudAccent;
+        ctx.lineWidth = 1.3;
+        ctx.beginPath();
+        ctx.moveTo(p[0] - 7, p[1]);
+        ctx.lineTo(p[0] + 7, p[1]);
+        ctx.moveTo(p[0], p[1] - 7);
+        ctx.lineTo(p[0], p[1] + 7);
+        ctx.stroke();
+      }
+    }
+    ctx.restore();
     void H;
   }
 

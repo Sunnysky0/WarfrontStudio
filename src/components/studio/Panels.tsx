@@ -179,7 +179,7 @@ function LayersPanel(props: PanelsProps) {
           <Card accent>
             <p className="text-wf-md font-semibold text-wf-text">Your story. Less busywork.</p>
             <p className="mt-1 text-wf-base leading-relaxed text-wf-text-3">
-              Select regions on the map, then hand them to a nation — the frontline is drawn for you from the attacker’s heartland.
+              Select regions, then hand them to a nation for a political transfer — or draw a frontline on the map when the war should ignore provincial borders.
             </p>
             <Button variant="outline" size="sm" className="mt-2 w-full" disabled={!props.selectionCount} onClick={props.onAutoDraw}>
               <Swords size={13} strokeWidth={1.75} />
@@ -410,7 +410,7 @@ function GuidePanel() {
           {[
             ["Set up the map", "Open Project → Map properties for projection, border year (1900 → present), detail, theme; toggle layers in this panel."],
             ["Create nations", "Nations tab: name, colour, flag. Select countries or provinces on the map (click; shift+drag paints) and add them as starting territory."],
-            ["Animate conquests", "Select regions, pick the conquering nation in Properties and press Create territory event. The frontline is auto-drawn from the attacker’s heartland."],
+            ["Animate conquests", "Territory events still auto-draw a front across painted regions. For a front that cuts through provinces, add a Drawn frontline clip and click vertices on the map; scrub and set another keyframe to make it advance."],
             ["Nation transitions", "Add a Nation transition event to rename/recolour/re-flag a state. Colours and names crossfade."],
             ["Disintegration", "Add a Disintegration event and list successor states with their provinces. Enable dissolve remainder to remove the old state entirely."],
             ["Camera", "Pan/zoom freely, then Set keyframe from view. The camera glides between keyframes."],

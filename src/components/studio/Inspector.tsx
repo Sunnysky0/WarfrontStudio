@@ -2,7 +2,7 @@
 import React, { useEffect, useState } from "react";
 import { Crosshair, Flag as FlagIcon, Map as MapIcon, Plus, SlidersHorizontal, Sparkles, Trash2, X } from "lucide-react";
 import type { Basemap } from "@/lib/studio/basemap";
-import { regionName, searchRegions } from "@/lib/studio/basemap";
+import { regionName, resolveRegionKey, searchRegions } from "@/lib/studio/basemap";
 import { MARKER_KINDS } from "@/lib/studio/drawing";
 import { FLAG_PRESETS, NATION_COLOR_PRESETS } from "@/lib/studio/presets";
 import type {
@@ -10,13 +10,17 @@ import type {
   DisintegrateEvent,
   Easing,
   FlagSpec,
+  FrontEvent,
   FrontMode,
+  FrontTheater,
   MapSettings,
   Nation,
   ProjectDoc,
   StudioEvent,
   TerritoryEvent,
 } from "@/lib/studio/types";
+import { cloneKeyframes, interpolateFront, keyframeAt } from "@/lib/studio/frontline";
+import { resolveState } from "@/lib/studio/state";
 import { EVENT_TYPE_LABELS } from "@/lib/studio/types";
 import { EventIcon } from "./eventStyle";
 import { FlagPreview } from "./FlagPreview";
@@ -461,6 +465,109 @@ function EventEditor(props: InspectorProps & { ev: StudioEvent }) {
         </>
       )}
 
+      {ev.type === "front" && (
+        <>
+          <Section title="Drawn frontline">
+            <p className="text-wf-sm leading-snug text-wf-text-4">
+              Click the map to place vertices. Double-click or Enter finishes a keyframe at the playhead. Fill is clipped to land, and to occupier and defender when a defender is set — otherwise a local pad around the line, so a landing does not paint a continent.
+            </p>
+            <Field label="Occupier">
+              <NationSelect project={project} value={ev.nation} onChange={(v) => up<FrontEvent>({ nation: v })} />
+            </Field>
+            <Field label="Defender" hint="Clips the fill to occupier and defender land.">
+              <NationSelect project={project} value={ev.against} allowNone onChange={(v) => up<FrontEvent>({ against: v || undefined, theater: v ? ev.theater ?? "sides" : ev.theater })} />
+            </Field>
+            <Field label="Clip fill to">
+              <Select
+                value={ev.theater ?? (ev.against ? "sides" : "land")}
+                onChange={(v) => up<FrontEvent>({ theater: v as FrontTheater })}
+                options={[
+                  { value: "sides", label: "Both sides’ land" },
+                  { value: "land", label: "All land (padded around the line)" },
+                  { value: "regions", label: "Selected regions" },
+                ]}
+              />
+            </Field>
+            {(ev.theater ?? (ev.against ? "sides" : "land")) === "regions" && (
+              <div className="flex flex-col gap-1.5">
+                <div className="flex gap-1.5">
+                  <Button
+                    size="xs"
+                    disabled={!selection.size}
+                    onClick={() => up<FrontEvent>({ clipRegions: Array.from(selection), theater: "regions" })}
+                  >
+                    Use map selection
+                  </Button>
+                  <Button
+                    size="xs"
+                    disabled={!ev.against || !basemap}
+                    onClick={() => {
+                      if (!ev.against || !basemap) return;
+                      const st = resolveState(project, props.time, (k) => resolveRegionKey(basemap, k), (k) => basemap.provincesByCountry.get(k));
+                      const keys = [...st.ownership.entries()].filter(([, id]) => id === ev.against).map(([k]) => k);
+                      up<FrontEvent>({ clipRegions: keys, theater: "regions" });
+                    }}
+                  >
+                    Snapshot defender
+                  </Button>
+                </div>
+                <span className="text-wf-sm text-wf-text-4">{ev.clipRegions?.length ?? 0} clip regions</span>
+              </div>
+            )}
+            <LonLatField label="Captured side (which half to fill)" value={ev.capturedSide} onChange={(v) => v && up<FrontEvent>({ capturedSide: v })} onPick={onPick} />
+            <Slider label="Frontline roughness" min={0} max={1} step={0.05} value={ev.roughness ?? 0.35} onChange={(v) => up<FrontEvent>({ roughness: v })} format={(v) => v.toFixed(2)} />
+            <Field label="Easing between keyframes">
+              <Select value={ev.easing ?? "easeInOut"} onChange={(v) => up<FrontEvent>({ easing: v })} options={EASINGS} />
+            </Field>
+            <Toggle checked={ev.fillOccupation !== false} onChange={(v) => up<FrontEvent>({ fillOccupation: v })} label="Fill occupied side" />
+            <Toggle checked={ev.showFrontline !== false} onChange={(v) => up<FrontEvent>({ showFrontline: v })} label="Draw glowing frontline" />
+            <Toggle checked={!!ev.closed} onChange={(v) => up<FrontEvent>({ closed: v })} label="Closed ring (pocket / landing)" />
+            <Toggle checked={ev.holdAfterEnd !== false} onChange={(v) => up<FrontEvent>({ holdAfterEnd: v })} label="Hold last shape after the clip ends" />
+          </Section>
+          <Section title="Keyframes" right={<Badge>{ev.keyframes.length}</Badge>}>
+            <Button
+              variant="accent"
+              size="sm"
+              className="w-full"
+              onClick={() => {
+                const offset = Math.max(0, Math.round((props.time - ev.start) * 10) / 10);
+                const points = interpolateFront(ev, offset);
+                if (!points || points.length < 2) return;
+                const kfs = cloneKeyframes(ev.keyframes);
+                const sampled = points.filter((_, i) => i % Math.max(1, Math.floor(points.length / 12)) === 0).slice(0, 16);
+                const next = { offset, points: sampled.map((p) => [p[0], p[1]] as [number, number]) };
+                const existing = keyframeAt(kfs, offset);
+                if (existing >= 0) kfs[existing] = next;
+                else kfs.push(next);
+                up<FrontEvent>({ keyframes: kfs });
+              }}
+            >
+              <Crosshair size={13} strokeWidth={1.75} />
+              Set keyframe at playhead
+            </Button>
+            <div className="mt-2 flex flex-col gap-1">
+              {ev.keyframes
+                .slice()
+                .sort((a, b) => a.offset - b.offset)
+                .map((kf, i) => (
+                  <div key={`${kf.offset}-${i}`} className="flex items-center gap-1.5 text-wf-sm">
+                    <span className="tnum w-12 text-wf-text-3">{kf.offset.toFixed(1)}s</span>
+                    <span className="min-w-0 flex-1 truncate text-wf-text-4">{kf.points.length} pts</span>
+                    <IconButton
+                      title="Delete keyframe"
+                      size="sm"
+                      onClick={() => up<FrontEvent>({ keyframes: ev.keyframes.filter((k) => k !== kf) })}
+                    >
+                      <X size={12} strokeWidth={2} />
+                    </IconButton>
+                  </div>
+                ))}
+              {!ev.keyframes.length && <span className="text-wf-sm text-wf-text-5">No keyframes yet — draw on the map.</span>}
+            </div>
+          </Section>
+        </>
+      )}
+
       {ev.type === "disintegrate" && (
         <>
           <Section title="Disintegration">
@@ -722,7 +829,7 @@ function NationEditor({
   onDelete: () => void;
   onPick: (cb: (ll: [number, number]) => void) => void;
 }) {
-  const usedIn = project.events.filter((e) => (e.type === "territory" && e.toNation === nation.id) || (e.type === "nationChange" && e.nation === nation.id)).length;
+  const usedIn = project.events.filter((e) => (e.type === "territory" && e.toNation === nation.id) || (e.type === "front" && (e.nation === nation.id || e.against === nation.id)) || (e.type === "nationChange" && e.nation === nation.id)).length;
   return (
     <>
       <Section

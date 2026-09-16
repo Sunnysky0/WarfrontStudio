@@ -4,6 +4,7 @@ import type {
   FlagSpec,
   FlagsEvent,
   FrontMode,
+  FrontTheater,
   InsetEvent,
   MarkerEvent,
   Nation,
@@ -14,6 +15,7 @@ import type {
   DisintegrateEvent,
   TextEvent,
 } from "./types";
+import { defaultTheater, interpolateFront, isClosedPolyline } from "./frontline";
 
 // ---------------------------------------------------------------- easing / math
 export function ease(kind: Easing | undefined, x: number): number {
@@ -113,6 +115,22 @@ export interface ActiveTransfer {
   seed: number;
 }
 
+export interface ActiveFront {
+  id: string;
+  eventId: string;
+  nation: string;
+  against?: string;
+  points: [number, number][];
+  capturedSide: [number, number];
+  closed: boolean;
+  theater: FrontTheater;
+  clipRegions?: string[];
+  fillOccupation: boolean;
+  showFrontline: boolean;
+  roughness: number;
+  seed: number;
+}
+
 export interface ResolvedState {
   t: number;
   camera: Camera;
@@ -120,6 +138,7 @@ export interface ResolvedState {
   /** canonical region key -> nation id */
   ownership: Map<string, string>;
   transfers: ActiveTransfer[];
+  fronts: ActiveFront[];
   year: string | null;
   subtitles: SubtitleEvent[];
   texts: TextEvent[];
@@ -131,7 +150,7 @@ export interface ResolvedState {
 export type KeyResolver = (key: string) => string;
 export type ProvinceLookup = (countryKey: string) => string[] | undefined;
 
-function hashSeed(s: string): number {
+export function hashSeed(s: string): number {
   let h = 2166136261;
   for (let i = 0; i < s.length; i++) {
     h ^= s.charCodeAt(i);
@@ -302,6 +321,33 @@ export function resolveState(
   });
   toApply.sort((a, b) => a.at - b.at || a.order - b.order).forEach((a) => a.apply());
 
+  const fronts: ActiveFront[] = [];
+  for (const e of events) {
+    if (e.type !== "front" || e.keyframes.length < 1) continue;
+    if (t < e.start) continue;
+    const holding = e.holdAfterEnd !== false;
+    if (t >= e.end && !holding) continue;
+    const local = t >= e.end ? Math.max(0, e.end - e.start) : t - e.start;
+    const points = interpolateFront(e, local);
+    if (!points || points.length < 2) continue;
+    const closed = isClosedPolyline(e.keyframes[0]?.points ?? points, e.closed);
+    fronts.push({
+      id: e.id,
+      eventId: e.id,
+      nation: e.nation,
+      against: e.against,
+      points,
+      capturedSide: e.capturedSide,
+      closed,
+      theater: e.theater ?? defaultTheater(e.against),
+      clipRegions: e.clipRegions,
+      fillOccupation: e.fillOccupation !== false,
+      showFrontline: e.showFrontline !== false,
+      roughness: e.roughness ?? 0.35,
+      seed: hashSeed(e.id),
+    });
+  }
+
   // --- HUD
   let year: string | null = null;
   const subtitles: SubtitleEvent[] = [];
@@ -327,6 +373,7 @@ export function resolveState(
     nations,
     ownership,
     transfers,
+    fronts,
     year,
     subtitles,
     texts,

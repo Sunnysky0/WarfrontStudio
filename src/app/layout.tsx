@@ -3,7 +3,7 @@ import "./globals.css";
 
 export const metadata: Metadata = {
   title: "Warfront Animation Studio",
-  description: "Create delicate, customized alternate-history warfront map videos with auto-drawn frontlines, layered basemaps and video export.",
+  description: "Create delicate, customized alternate-history warfront map videos with drawn frontlines, layered basemaps and video export.",
 };
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {

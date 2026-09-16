@@ -2,8 +2,10 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { loadBasemap, type Basemap, type RegionFeature } from "@/lib/studio/basemap";
 import { MapRenderer } from "@/lib/studio/renderer";
-import type { Camera, EventType, FlagSpec, FrontMode, MapSettings, MarkerKind, Nation, ProjectDoc, StudioEvent } from "@/lib/studio/types";
+import type { Camera, EventType, FlagSpec, FrontEvent, FrontMode, MapSettings, MarkerKind, Nation, ProjectDoc, StudioEvent } from "@/lib/studio/types";
 import { uid } from "@/lib/studio/types";
+import { cloneKeyframes, inferCapturedSide, interpolateFront, keyframeAt, nearestKeyframeIndex } from "@/lib/studio/frontline";
+import type { FrontEditOverlay } from "@/lib/studio/renderer";
 import MapView, { type Tool } from "./MapView";
 import Timeline from "./Timeline";
 import Inspector, { type PropsTab } from "./Inspector";
@@ -81,6 +83,8 @@ export default function Studio({ projectId, initial }: { projectId: string; init
   const [renderVersion, setRenderVersion] = useState(0);
   const pickRef = useRef<((ll: [number, number]) => void) | null>(null);
   const prevToolRef = useRef<Tool>("select");
+  const [frontDraft, setFrontDraft] = useState<[number, number][] | null>(null);
+  const [frontHandle, setFrontHandle] = useState<number | null>(null);
 
   // ------------------------------------------------------------ chrome state
   // Purely presentational: none of this is persisted to the document, so it can
@@ -173,6 +177,34 @@ export default function Studio({ projectId, initial }: { projectId: string; init
   // Same derivation the scene strip uses, so the strip chip and the stage
   // caption can never disagree.
   const caption = useMemo(() => activeChapter(project, time).title, [project, time]);
+  const frontEdit = useMemo((): FrontEditOverlay | null => {
+    if (tool !== "front" && selectedEvent?.type !== "front") return null;
+    const ev = selectedEvent?.type === "front" ? selectedEvent : null;
+    if (frontDraft) {
+      return {
+        handles: frontDraft,
+        line: frontDraft,
+        draft: true,
+        closed: false,
+        selectedHandle: frontHandle,
+        capturedSide: ev?.capturedSide ?? null,
+      };
+    }
+    if (!ev) return tool === "front" ? { handles: [], draft: true } : null;
+    const offset = Math.max(0, time - ev.start);
+    const exact = keyframeAt(ev.keyframes, offset);
+    const ni = nearestKeyframeIndex(ev.keyframes, offset);
+    const handles = exact >= 0 ? ev.keyframes[exact].points : ni >= 0 ? ev.keyframes[ni].points : [];
+    return {
+      handles,
+      line: interpolateFront(ev, offset) ?? handles,
+      draft: false,
+      closed: !!ev.closed,
+      selectedHandle: frontHandle,
+      capturedSide: ev.capturedSide,
+      pickCaptured: exact >= 0 && handles.length >= 2,
+    };
+  }, [frontDraft, frontHandle, selectedEvent, time, tool]);
 
   // ------------------------------------------------------------ mutations
   const updateEvent = useCallback(
@@ -205,6 +237,22 @@ export default function Studio({ projectId, initial }: { projectId: string; init
         case "territory":
           ev = { ...base, type, end: t + 3, regions: Array.from(selection), toNation: nationId, mode: "auto", roughness: 0.6, easing: "easeInOut", showFrontline: true };
           break;
+        case "front":
+          ev = {
+            ...base,
+            type,
+            end: t + 8,
+            nation: nationId,
+            keyframes: [],
+            capturedSide: [cam.lon, cam.lat],
+            theater: "sides",
+            fillOccupation: true,
+            showFrontline: true,
+            holdAfterEnd: true,
+            roughness: 0.35,
+            easing: "easeInOut",
+          };
+          break;
         case "nationChange":
           ev = { ...base, type, end: t + 2, nation: nationId };
           break;
@@ -232,6 +280,11 @@ export default function Studio({ projectId, initial }: { projectId: string; init
       setSelectedEventId(ev.id);
       setSelectedNationId(null);
       setPropsTab("event");
+      if (ev.type === "front") {
+        setTool("front");
+        setFrontDraft(null);
+        setFrontHandle(null);
+      }
       return ev;
     },
     [currentCamera, markerKind, selectedNationId, selection, setProject]
@@ -248,6 +301,11 @@ export default function Studio({ projectId, initial }: { projectId: string; init
     if (!ev) return;
     const dur = ev.end - ev.start;
     const copy = { ...ev, id: uid(ev.type), start: ev.end, end: ev.end + dur } as StudioEvent;
+    if (copy.type === "front") {
+      copy.keyframes = cloneKeyframes(copy.keyframes);
+      copy.clipRegions = copy.clipRegions?.slice();
+      copy.capturedSide = [copy.capturedSide[0], copy.capturedSide[1]];
+    }
     setProject((p) => ({ ...p, events: [...p.events, copy] }));
     setSelectedEventId(copy.id);
   }, [selectedEventId, setProject]);
@@ -323,17 +381,204 @@ export default function Studio({ projectId, initial }: { projectId: string; init
     [addEvent, markerKind, tool]
   );
 
+  const patchFront = useCallback(
+    (id: string, fn: (e: FrontEvent) => FrontEvent, record = true) => {
+      setProject((p) => ({
+        ...p,
+        events: p.events.map((e) => (e.id === id && e.type === "front" ? fn(e) : e)),
+      }), record);
+    },
+    [setProject]
+  );
+
+  const ensureFrontEvent = useCallback((): FrontEvent => {
+    const cur = projectRef.current.events.find((e) => e.id === selectedEventId);
+    if (cur?.type === "front") return cur;
+    return addEvent("front") as FrontEvent;
+  }, [addEvent, selectedEventId]);
+
+  const finishFrontDraft = useCallback(() => {
+    const draft = frontDraft;
+    if (!draft || draft.length < 2) {
+      setFrontDraft(null);
+      return;
+    }
+    const ev = ensureFrontEvent();
+    const offset = Math.max(0, Math.round((timeRef.current - ev.start) * 10) / 10);
+    const closed = draft.length >= 3 && Math.hypot(draft[0][0] - draft[draft.length - 1][0], draft[0][1] - draft[draft.length - 1][1]) < 0.05;
+    patchFront(ev.id, (e) => {
+      const kfs = cloneKeyframes(e.keyframes);
+      const existing = keyframeAt(kfs, offset);
+      const next = { offset, points: draft.map((p) => [p[0], p[1]] as [number, number]) };
+      if (existing >= 0) kfs[existing] = next;
+      else kfs.push(next);
+      return {
+        ...e,
+        keyframes: kfs,
+        closed: e.closed || closed,
+        capturedSide: e.keyframes.length ? e.capturedSide : inferCapturedSide(draft),
+      };
+    });
+    setFrontDraft(null);
+    setFrontHandle(null);
+  }, [ensureFrontEvent, frontDraft, patchFront]);
+
+  const onFrontAddVertex = useCallback(
+    (ll: [number, number]) => {
+      if (frontDraft) {
+        setFrontDraft([...frontDraft, ll]);
+        return;
+      }
+      ensureFrontEvent();
+      setFrontDraft([ll]);
+    },
+    [ensureFrontEvent, frontDraft]
+  );
+
+  const onFrontMoveHandle = useCallback(
+    (index: number, ll: [number, number], record: boolean) => {
+      if (frontDraft) {
+        setFrontDraft((d) => {
+          if (!d || !d[index]) return d;
+          const next = d.slice();
+          next[index] = ll;
+          return next;
+        });
+        return;
+      }
+      const ev = projectRef.current.events.find((e) => e.id === selectedEventId);
+      if (ev?.type !== "front") return;
+      const offset = Math.max(0, Math.round((timeRef.current - ev.start) * 10) / 10);
+      patchFront(
+        ev.id,
+        (e) => {
+          const kfs = cloneKeyframes(e.keyframes);
+          let ki = keyframeAt(kfs, offset);
+          if (ki < 0) {
+            const ni = nearestKeyframeIndex(e.keyframes, offset);
+            const src = ni >= 0 ? e.keyframes[ni].points : e.keyframes[0]?.points ?? [];
+            kfs.push({ offset, points: src.map((p) => [p[0], p[1]] as [number, number]) });
+            ki = kfs.length - 1;
+          }
+          if (!kfs[ki]?.points[index]) return e;
+          kfs[ki].points[index] = ll;
+          return { ...e, keyframes: kfs };
+        },
+        record
+      );
+    },
+    [frontDraft, patchFront, selectedEventId]
+  );
+
   // Selection helpers. Each also moves the Properties panel to the matching
   // editor — done here rather than in an effect on the ids, so the tab switch
   // is part of the same render as the selection instead of a second pass.
   const selectEvent = useCallback((id: string | null) => {
     setSelectedEventId(id);
+    setFrontDraft(null);
+    setFrontHandle(null);
     if (id) {
       setSelectedNationId(null);
       setPropsTab("event");
       setRightOpen(true);
+      const ev = projectRef.current.events.find((e) => e.id === id);
+      if (ev?.type === "front") setTool("front");
     }
   }, []);
+
+  const onFrontInsertHandle = useCallback(
+    (index: number, ll: [number, number]) => {
+      if (frontDraft) {
+        setFrontDraft((d) => {
+          if (!d) return d;
+          const next = d.slice();
+          next.splice(index, 0, ll);
+          return next;
+        });
+        setFrontHandle(index);
+        return;
+      }
+      const ev = projectRef.current.events.find((e) => e.id === selectedEventId);
+      if (ev?.type !== "front") return;
+      const offset = Math.max(0, Math.round((timeRef.current - ev.start) * 10) / 10);
+      patchFront(ev.id, (e) => {
+        const kfs = cloneKeyframes(e.keyframes);
+        let ki = keyframeAt(kfs, offset);
+        if (ki < 0) {
+          const ni = nearestKeyframeIndex(e.keyframes, offset);
+          const src = ni >= 0 ? e.keyframes[ni].points : e.keyframes[0]?.points ?? [];
+          kfs.push({ offset, points: src.map((p) => [p[0], p[1]] as [number, number]) });
+          ki = kfs.length - 1;
+        }
+        kfs[ki].points.splice(index, 0, ll);
+        return { ...e, keyframes: kfs };
+      });
+      setFrontHandle(index);
+    },
+    [frontDraft, patchFront, selectedEventId]
+  );
+
+  const onFrontPickCaptured = useCallback(
+    (ll: [number, number]) => {
+      const ev = projectRef.current.events.find((e) => e.id === selectedEventId);
+      if (ev?.type !== "front") return;
+      patchFront(ev.id, (e) => ({ ...e, capturedSide: ll }));
+    },
+    [patchFront, selectedEventId]
+  );
+
+  const onFrontClose = useCallback(() => {
+    if (frontDraft && frontDraft.length >= 3) {
+      const pts = frontDraft.slice();
+      const a = pts[0];
+      if (Math.hypot(a[0] - pts[pts.length - 1][0], a[1] - pts[pts.length - 1][1]) > 0.02) pts.push([a[0], a[1]]);
+      const ev = ensureFrontEvent();
+      const offset = Math.max(0, Math.round((timeRef.current - ev.start) * 10) / 10);
+      patchFront(ev.id, (e) => {
+        const kfs = cloneKeyframes(e.keyframes);
+        const existing = keyframeAt(kfs, offset);
+        const next = { offset, points: pts.map((p) => [p[0], p[1]] as [number, number]) };
+        if (existing >= 0) kfs[existing] = next;
+        else kfs.push(next);
+        return {
+          ...e,
+          keyframes: kfs,
+          closed: true,
+          capturedSide: e.keyframes.length ? e.capturedSide : inferCapturedSide(pts),
+        };
+      });
+      setFrontDraft(null);
+      setFrontHandle(null);
+      return;
+    }
+    const ev = projectRef.current.events.find((e) => e.id === selectedEventId);
+    if (ev?.type === "front") patchFront(ev.id, (e) => ({ ...e, closed: true }));
+  }, [ensureFrontEvent, frontDraft, patchFront, selectedEventId]);
+
+  const setFrontKeyframe = useCallback(() => {
+    const ev = projectRef.current.events.find((e) => e.id === selectedEventId);
+    if (ev?.type !== "front") return;
+    if (frontDraft && frontDraft.length >= 2) {
+      finishFrontDraft();
+      return;
+    }
+    const offset = Math.max(0, Math.round((timeRef.current - ev.start) * 10) / 10);
+    const points = interpolateFront(ev, offset);
+    if (!points || points.length < 2) return;
+    const ni = nearestKeyframeIndex(ev.keyframes, offset);
+    const count = ni >= 0 ? Math.max(4, ev.keyframes[ni].points.length) : 12;
+    const step = Math.max(1, Math.floor(points.length / count));
+    const sampled = points.filter((_, i) => i % step === 0).slice(0, count);
+    if (sampled.length < 2) return;
+    patchFront(ev.id, (e) => {
+      const kfs = cloneKeyframes(e.keyframes);
+      const existing = keyframeAt(kfs, offset);
+      const next = { offset, points: sampled.map((p) => [p[0], p[1]] as [number, number]) };
+      if (existing >= 0) kfs[existing] = next;
+      else kfs.push(next);
+      return { ...e, keyframes: kfs };
+    });
+  }, [finishFrontDraft, frontDraft, patchFront, selectedEventId]);
   const selectNation = useCallback((id: string | null) => {
     setSelectedNationId(id);
     if (id) {
@@ -358,10 +603,37 @@ export default function Studio({ projectId, initial }: { projectId: string; init
         return;
       }
       if (typing) return;
+      if (tool === "front" && e.key === "Enter") {
+        e.preventDefault();
+        finishFrontDraft();
+        return;
+      }
       if (e.code === "Space") {
         e.preventDefault();
         setPlaying((p) => !p);
       } else if (e.key === "Delete" || e.key === "Backspace") {
+        if (tool === "front" && frontDraft && frontDraft.length) {
+          e.preventDefault();
+          setFrontDraft((d) => (d && d.length ? d.slice(0, -1) : d));
+          return;
+        }
+        if (tool === "front" && frontHandle != null) {
+          const ev = projectRef.current.events.find((x) => x.id === selectedEventId);
+          if (ev?.type === "front") {
+            e.preventDefault();
+            const hi = frontHandle;
+            patchFront(ev.id, (fe) => {
+              const offset = Math.max(0, timeRef.current - fe.start);
+              const kfs = cloneKeyframes(fe.keyframes);
+              const ki = keyframeAt(kfs, offset);
+              if (ki < 0 || !kfs[ki].points[hi] || kfs[ki].points.length <= 2) return fe;
+              kfs[ki].points.splice(hi, 1);
+              return { ...fe, keyframes: kfs };
+            });
+            setFrontHandle(null);
+            return;
+          }
+        }
         deleteSelected();
       } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "z") {
         e.preventDefault();
@@ -380,16 +652,22 @@ export default function Studio({ projectId, initial }: { projectId: string; init
       } else if (e.key === "Home") {
         setTime(0);
       } else if (e.key === "Escape") {
+        if (frontDraft) {
+          setFrontDraft(null);
+          return;
+        }
         setSelection(new Set());
         if (tool === "pick") {
           pickRef.current = null;
           setTool(prevToolRef.current);
+        } else if (tool === "front") {
+          setTool("select");
         }
       }
     };
     window.addEventListener("keydown", h);
     return () => window.removeEventListener("keydown", h);
-  }, [deleteSelected, duplicateSelected, redo, save, tool, undo]);
+  }, [deleteSelected, duplicateSelected, finishFrontDraft, frontDraft, frontHandle, patchFront, redo, save, selectedEventId, tool, undo]);
 
   // ------------------------------------------------------------ layout
   return (
@@ -492,6 +770,8 @@ export default function Studio({ projectId, initial }: { projectId: string; init
                 viewDetached={!!viewCamera}
                 onFollowTimeline={() => setViewCamera(null)}
                 onSetKeyframe={setKeyframeFromView}
+                frontSelected={selectedEvent?.type === "front"}
+                onSetFrontKeyframe={setFrontKeyframe}
                 map={project.map}
                 onUpdateMap={updateMap}
               />
@@ -511,6 +791,14 @@ export default function Studio({ projectId, initial }: { projectId: string; init
                   renderVersion={renderVersion}
                   showHud={showHud}
                   caption={caption}
+                  frontEdit={frontEdit}
+                  onFrontAddVertex={onFrontAddVertex}
+                  onFrontFinish={finishFrontDraft}
+                  onFrontClose={onFrontClose}
+                  onFrontMoveHandle={onFrontMoveHandle}
+                  onFrontInsertHandle={onFrontInsertHandle}
+                  onFrontSelectHandle={setFrontHandle}
+                  onFrontPickCaptured={onFrontPickCaptured}
                 />
                 {/* Basemap progress lives in the status bar; only the failure
                     case needs to interrupt, because the stage stays empty. */}

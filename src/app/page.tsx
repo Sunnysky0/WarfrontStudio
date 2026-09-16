@@ -469,7 +469,7 @@ function TemplatesPane({
 const ASSET_GROUPS: { title: string; items: string[] }[] = [
   { title: "Base map", items: ["Land & coastlines", "Countries and provinces", "Lakes and rivers", "Railroads", "Cities with population ranks", "Graticule"] },
   { title: "Historical borders", items: ["1900", "1914", "1935", "1939", "1945", "2010", "Present day"] },
-  { title: "Events", items: ["Territory transfer with auto frontline", "Nation change", "Disintegration", "Camera moves", "Year & subtitle titles", "Map text", "Markers", "Flag clashes", "Inset maps"] },
+  { title: "Events", items: ["Territory transfer with auto frontline", "Drawn frontline (keyframed polyline)", "Nation change", "Disintegration", "Camera moves", "Year & subtitle titles", "Map text", "Markers", "Flag clashes", "Inset maps"] },
   { title: "Export", items: ["MP4 (H.264) via WebCodecs", "WebM (VP9)", "PNG frame snapshot", "Frame-accurate offline render"] },
 ];
 
@@ -505,7 +505,7 @@ function AssetsPane() {
 const STEPS: { title: string; body: string }[] = [
   { title: "Create a project", body: "Start from the Great Asian War template to see a finished timeline, or open a blank world and pick a border year." },
   { title: "Add your nations", body: "In the Nations panel, give each side a colour and a flag. Nations own regions; events move regions between them." },
-  { title: "Paint territory", body: "Select regions on the map — click, or shift+drag to paint — then hand them to a nation. The frontline is drawn for you." },
+  { title: "Paint territory", body: "Select regions on the map — click, or shift+drag to paint — then hand them to a nation for a political transfer. Draw a frontline when the war should cut across provincial borders." },
   { title: "Move the camera", body: "Pan and zoom the preview, then set a camera keyframe from the view. Keyframes interpolate between each other." },
   { title: "Narrate it", body: "Year markers, subtitles, map text, markers, flag clashes and inset maps are all events on the timeline." },
   { title: "Export", body: "Render an MP4 or WebM entirely in the browser. The export uses the same renderer as the preview, frame for frame." },

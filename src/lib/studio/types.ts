@@ -126,6 +126,45 @@ export interface TerritoryEvent extends BaseEvent {
   clearProvinces?: boolean;
 }
 
+export interface FrontKeyframe {
+  /** Seconds from event.start. First keyframe should be 0. */
+  offset: number;
+  /** Open or closed polyline, coordinates [lon, lat]. */
+  points: [number, number][];
+}
+
+export type FrontTheater = "land" | "sides" | "regions";
+
+export interface FrontEvent extends BaseEvent {
+  type: "front";
+  /** Occupying / advancing nation (fill colour). */
+  nation: string;
+  /** Defender; default theater is occupier ∪ defender land. */
+  against?: string;
+  keyframes: FrontKeyframe[];
+  /**
+   * A point on the captured side of the line, used to pick which
+   * half-plane to fill. Ignored when `closed` is true.
+   */
+  capturedSide: [number, number];
+  /** If true (or first≈last), fill the ring interior — pockets / landings. */
+  closed?: boolean;
+  /**
+   * Extra clip besides land.
+   * - land: all land on the captured side (escape hatch; pad the line or it floods a continent)
+   * - sides: occupier ∪ defender current fills (default when `against` is set)
+   * - regions: frozen region-key list (`clipRegions`)
+   */
+  theater?: FrontTheater;
+  clipRegions?: string[];
+  fillOccupation?: boolean;
+  showFrontline?: boolean;
+  /** Keep the last keyframe painted after `end`. Default true. */
+  holdAfterEnd?: boolean;
+  roughness?: number;
+  easing?: Easing;
+}
+
 export interface NationChangeEvent extends BaseEvent {
   type: "nationChange";
   nation: string;
@@ -216,6 +255,7 @@ export interface YearEvent extends BaseEvent {
 export type StudioEvent =
   | CameraEvent
   | TerritoryEvent
+  | FrontEvent
   | NationChangeEvent
   | DisintegrateEvent
   | SubtitleEvent
@@ -376,7 +416,8 @@ export const PROJECTIONS: { id: ProjectionId; label: string }[] = [
 
 export const EVENT_TYPE_LABELS: Record<EventType, string> = {
   camera: "Camera",
-  territory: "Territory / Frontline",
+  territory: "Territory",
+  front: "Drawn frontline",
   nationChange: "Nation transition",
   disintegrate: "Disintegration",
   subtitle: "Subtitle",
@@ -391,6 +432,7 @@ export const TRACK_ORDER: EventType[] = [
   "year",
   "camera",
   "territory",
+  "front",
   "disintegrate",
   "nationChange",
   "marker",
