@@ -2,11 +2,12 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { loadBasemap, type Basemap, type RegionFeature } from "@/lib/studio/basemap";
 import { MapRenderer } from "@/lib/studio/renderer";
-import type { Camera, EventType, FlagSpec, FrontEvent, FrontMode, MapSettings, MarkerKind, Nation, ProjectDoc, StudioEvent } from "@/lib/studio/types";
+import type { Camera, EventType, FlagSpec, FrontBezierPath, FrontEvent, FrontMode, MapSettings, MarkerKind, Nation, ProjectDoc, StudioEvent } from "@/lib/studio/types";
 import { uid } from "@/lib/studio/types";
-import { cloneKeyframes, inferCapturedSide, interpolateFront, keyframeAt, nearestKeyframeIndex } from "@/lib/studio/frontline";
+import { cloneKeyframes, inferCapturedSide, interpolateFront, keyframeAt, keyframePolyline } from "@/lib/studio/frontline";
+import { cloneBezierPath, lonDelta, polylineToLinearBezierPath, quantizeLonLat, reverseBezierPath, setBezierHandle, splitBezierPathSegment } from "@/lib/studio/front-path";
 import type { FrontEditOverlay } from "@/lib/studio/renderer";
-import MapView, { type Tool } from "./MapView";
+import MapView, { type FrontFitPrecision, type FrontToolMode, type Tool } from "./MapView";
 import Timeline from "./Timeline";
 import Inspector, { type PropsTab } from "./Inspector";
 import Panels, { type LeftTab } from "./Panels";
@@ -27,13 +28,43 @@ function toggled<T>(set: Set<T>, v: T): Set<T> {
   return next;
 }
 
+function editablePathFromPolyline(points: [number, number][], closed: boolean): FrontBezierPath {
+  const step = Math.max(1, Math.floor(points.length / 96));
+  const sampled = points.filter((_, i) => i % step === 0).slice(0, 128);
+  return polylineToLinearBezierPath(sampled, closed);
+}
+
+function editableFrontKeyframe(event: FrontEvent, offset: number): { keyframes: FrontEvent["keyframes"]; index: number; path: FrontBezierPath } | null {
+  const keyframes = cloneKeyframes(event.keyframes);
+  let index = keyframeAt(keyframes, offset);
+  if (index >= 0) {
+    const current = keyframes[index];
+    if ((current.path?.nodes.length ?? 0) >= 2 || (current.points?.length ?? 0) >= 2) {
+      const path = current.path ?? polylineToLinearBezierPath(keyframePolyline(current, !!event.closed), !!event.closed);
+      keyframes[index] = { offset: current.offset, path };
+      return { keyframes, index, path };
+    }
+  }
+  const points = interpolateFront(event, offset);
+  if (!points || points.length < 2) return null;
+  const path = editablePathFromPolyline(points, !!event.closed);
+  if (index >= 0) keyframes[index] = { offset, path };
+  else {
+    keyframes.push({ offset, path });
+    index = keyframes.length - 1;
+  }
+  return { keyframes, index, path };
+}
+
 export default function Studio({ projectId, initial }: { projectId: string; initial: ProjectDoc }) {
   // ------------------------------------------------------------ document state + history
   const [project, setProjectRaw] = useState<ProjectDoc>(initial);
   const past = useRef<ProjectDoc[]>([]);
   const future = useRef<ProjectDoc[]>([]);
   const projectRef = useRef(project);
-  projectRef.current = project;
+  useEffect(() => {
+    projectRef.current = project;
+  }, [project]);
   const [saveState, setSaveState] = useState<SaveState>("saved");
 
   const setProject = useCallback((updater: (p: ProjectDoc) => ProjectDoc, record = true) => {
@@ -83,8 +114,21 @@ export default function Studio({ projectId, initial }: { projectId: string; init
   const [renderVersion, setRenderVersion] = useState(0);
   const pickRef = useRef<((ll: [number, number]) => void) | null>(null);
   const prevToolRef = useRef<Tool>("select");
-  const [frontDraft, setFrontDraft] = useState<[number, number][] | null>(null);
+  const [frontDraft, setFrontDraft] = useState<FrontBezierPath | null>(null);
   const [frontHandle, setFrontHandle] = useState<number | null>(null);
+  const [frontControl, setFrontControl] = useState<{ index: number; side: "in" | "out" } | null>(null);
+  const [frontMode, setFrontMode] = useState<FrontToolMode>("freehand");
+  const [frontPrecision, setFrontPrecision] = useState<FrontFitPrecision>("exact");
+  const [frontStabilization, setFrontStabilization] = useState(0);
+  const [frontCancelVersion, setFrontCancelVersion] = useState(0);
+  const frontGestureActive = useRef(false);
+  const frontDragRecorded = useRef(false);
+  const onFrontGestureChange = useCallback((active: boolean) => {
+    frontGestureActive.current = active;
+  }, []);
+  const onFrontGestureCancel = useCallback(() => {
+    frontDragRecorded.current = false;
+  }, []);
 
   // ------------------------------------------------------------ chrome state
   // Purely presentational: none of this is persisted to the document, so it can
@@ -102,8 +146,11 @@ export default function Studio({ projectId, initial }: { projectId: string; init
   // ------------------------------------------------------------ basemap loading
   useEffect(() => {
     let cancelled = false;
-    setBasemapLoading(true);
-    setBasemapError(null);
+    queueMicrotask(() => {
+      if (cancelled) return;
+      setBasemapLoading(true);
+      setBasemapError(null);
+    });
     loadBasemap(project.map.lod, project.map.borderYear)
       .then((bm) => {
         if (cancelled) return;
@@ -120,7 +167,9 @@ export default function Studio({ projectId, initial }: { projectId: string; init
 
   // ------------------------------------------------------------ playback
   const timeRef = useRef(time);
-  timeRef.current = time;
+  useEffect(() => {
+    timeRef.current = time;
+  }, [time]);
   useEffect(() => {
     if (!playing) return;
     let raf = 0;
@@ -182,29 +231,34 @@ export default function Studio({ projectId, initial }: { projectId: string; init
     const ev = selectedEvent?.type === "front" ? selectedEvent : null;
     if (frontDraft) {
       return {
-        handles: frontDraft,
-        line: frontDraft,
+        handles: frontDraft.nodes.map((node) => node.anchor),
+        path: frontDraft,
         draft: true,
-        closed: false,
+        closed: !!ev?.closed,
         selectedHandle: frontHandle,
+        selectedControl: frontControl,
         capturedSide: ev?.capturedSide ?? null,
       };
     }
     if (!ev) return tool === "front" ? { handles: [], draft: true } : null;
-    const offset = Math.max(0, time - ev.start);
+    const offset = Math.max(0, Math.round((time - ev.start) * 10) / 10);
     const exact = keyframeAt(ev.keyframes, offset);
-    const ni = nearestKeyframeIndex(ev.keyframes, offset);
-    const handles = exact >= 0 ? ev.keyframes[exact].points : ni >= 0 ? ev.keyframes[ni].points : [];
+    const kf = exact >= 0 ? ev.keyframes[exact] : null;
+    const line = interpolateFront(ev, offset) ?? [];
+    const path = kf?.path ?? (kf?.points?.length ? polylineToLinearBezierPath(keyframePolyline(kf, !!ev.closed), !!ev.closed) : line.length >= 2 ? editablePathFromPolyline(line, !!ev.closed) : undefined);
+    const handles = path?.nodes.map((node) => node.anchor) ?? [];
     return {
       handles,
-      line: interpolateFront(ev, offset) ?? handles,
+      path,
+      line: line.length ? line : handles,
       draft: false,
       closed: !!ev.closed,
       selectedHandle: frontHandle,
+      selectedControl: frontControl,
       capturedSide: ev.capturedSide,
       pickCaptured: exact >= 0 && handles.length >= 2,
     };
-  }, [frontDraft, frontHandle, selectedEvent, time, tool]);
+  }, [frontControl, frontDraft, frontHandle, selectedEvent, time, tool]);
 
   // ------------------------------------------------------------ mutations
   const updateEvent = useCallback(
@@ -249,7 +303,7 @@ export default function Studio({ projectId, initial }: { projectId: string; init
             fillOccupation: true,
             showFrontline: true,
             holdAfterEnd: true,
-            roughness: 0.35,
+            roughness: 0,
             easing: "easeInOut",
           };
           break;
@@ -397,51 +451,64 @@ export default function Studio({ projectId, initial }: { projectId: string; init
     return addEvent("front") as FrontEvent;
   }, [addEvent, selectedEventId]);
 
+  const commitFrontPath = useCallback(
+    (path: FrontBezierPath, closed = false) => {
+      if (path.nodes.length < 2) return;
+      const ev = ensureFrontEvent();
+      const offset = Math.max(0, Math.round((timeRef.current - ev.start) * 10) / 10);
+      patchFront(ev.id, (e) => {
+        const keyframes = cloneKeyframes(e.keyframes);
+        const existing = keyframeAt(keyframes, offset);
+        const next = { offset, path: cloneBezierPath(path) };
+        if (existing >= 0) keyframes[existing] = next;
+        else keyframes.push(next);
+        return {
+          ...e,
+          keyframes,
+          closed: e.closed || closed,
+          capturedSide: e.keyframes.length ? e.capturedSide : inferCapturedSide(path.nodes.map((node) => node.anchor)),
+        };
+      });
+      setFrontDraft(null);
+      setFrontHandle(null);
+      setFrontControl(null);
+    },
+    [ensureFrontEvent, patchFront]
+  );
+
   const finishFrontDraft = useCallback(() => {
-    const draft = frontDraft;
-    if (!draft || draft.length < 2) {
+    if (!frontDraft || frontDraft.nodes.length < 2) {
       setFrontDraft(null);
       return;
     }
-    const ev = ensureFrontEvent();
-    const offset = Math.max(0, Math.round((timeRef.current - ev.start) * 10) / 10);
-    const closed = draft.length >= 3 && Math.hypot(draft[0][0] - draft[draft.length - 1][0], draft[0][1] - draft[draft.length - 1][1]) < 0.05;
-    patchFront(ev.id, (e) => {
-      const kfs = cloneKeyframes(e.keyframes);
-      const existing = keyframeAt(kfs, offset);
-      const next = { offset, points: draft.map((p) => [p[0], p[1]] as [number, number]) };
-      if (existing >= 0) kfs[existing] = next;
-      else kfs.push(next);
-      return {
-        ...e,
-        keyframes: kfs,
-        closed: e.closed || closed,
-        capturedSide: e.keyframes.length ? e.capturedSide : inferCapturedSide(draft),
-      };
-    });
-    setFrontDraft(null);
-    setFrontHandle(null);
-  }, [ensureFrontEvent, frontDraft, patchFront]);
+    commitFrontPath(frontDraft, false);
+  }, [commitFrontPath, frontDraft]);
 
-  const onFrontAddVertex = useCallback(
-    (ll: [number, number]) => {
-      if (frontDraft) {
-        setFrontDraft([...frontDraft, ll]);
-        return;
-      }
+  const onFrontAddPenNode = useCallback(
+    (anchor: [number, number], handle?: [number, number]) => {
       ensureFrontEvent();
-      setFrontDraft([ll]);
+      const point = quantizeLonLat(anchor);
+      setFrontDraft((draft) => {
+        const next = draft ? cloneBezierPath(draft) : { kind: "bezier" as const, nodes: [] };
+        next.nodes.push({
+          anchor: point,
+          in: handle ? [-handle[0], -handle[1]] : undefined,
+          out: handle ? [handle[0], handle[1]] : undefined,
+          linked: !!handle,
+        });
+        return next;
+      });
     },
-    [ensureFrontEvent, frontDraft]
+    [ensureFrontEvent]
   );
 
-  const onFrontMoveHandle = useCallback(
-    (index: number, ll: [number, number], record: boolean) => {
+  const onFrontMoveNode = useCallback(
+    (index: number, ll: [number, number], finish: boolean) => {
       if (frontDraft) {
-        setFrontDraft((d) => {
-          if (!d || !d[index]) return d;
-          const next = d.slice();
-          next[index] = ll;
+        setFrontDraft((draft) => {
+          if (!draft?.nodes[index]) return draft;
+          const next = cloneBezierPath(draft);
+          next.nodes[index].anchor = quantizeLonLat(ll);
           return next;
         });
         return;
@@ -449,23 +516,44 @@ export default function Studio({ projectId, initial }: { projectId: string; init
       const ev = projectRef.current.events.find((e) => e.id === selectedEventId);
       if (ev?.type !== "front") return;
       const offset = Math.max(0, Math.round((timeRef.current - ev.start) * 10) / 10);
-      patchFront(
-        ev.id,
-        (e) => {
-          const kfs = cloneKeyframes(e.keyframes);
-          let ki = keyframeAt(kfs, offset);
-          if (ki < 0) {
-            const ni = nearestKeyframeIndex(e.keyframes, offset);
-            const src = ni >= 0 ? e.keyframes[ni].points : e.keyframes[0]?.points ?? [];
-            kfs.push({ offset, points: src.map((p) => [p[0], p[1]] as [number, number]) });
-            ki = kfs.length - 1;
-          }
-          if (!kfs[ki]?.points[index]) return e;
-          kfs[ki].points[index] = ll;
-          return { ...e, keyframes: kfs };
-        },
-        record
-      );
+      const shouldRecord = !frontDragRecorded.current;
+      patchFront(ev.id, (e) => {
+        const editable = editableFrontKeyframe(e, offset);
+        if (!editable?.path.nodes[index]) return e;
+        editable.path.nodes[index].anchor = quantizeLonLat(ll);
+        editable.keyframes[editable.index] = { offset, path: editable.path };
+        return { ...e, keyframes: editable.keyframes };
+      }, shouldRecord);
+      if (!finish) frontDragRecorded.current = true;
+      else frontDragRecorded.current = false;
+    },
+    [frontDraft, patchFront, selectedEventId]
+  );
+
+  const onFrontMoveControl = useCallback(
+    (index: number, side: "in" | "out", ll: [number, number], finish: boolean, breakLink: boolean) => {
+      const apply = (path: FrontBezierPath) => {
+        const node = path.nodes[index];
+        if (!node) return path;
+        return setBezierHandle(path, index, side, [lonDelta(node.anchor[0], ll[0]), ll[1] - node.anchor[1]], breakLink);
+      };
+      if (frontDraft) {
+        setFrontDraft((draft) => (draft ? apply(draft) : draft));
+        return;
+      }
+      const ev = projectRef.current.events.find((e) => e.id === selectedEventId);
+      if (ev?.type !== "front") return;
+      const offset = Math.max(0, Math.round((timeRef.current - ev.start) * 10) / 10);
+      const shouldRecord = !frontDragRecorded.current;
+      patchFront(ev.id, (e) => {
+        const editable = editableFrontKeyframe(e, offset);
+        if (!editable) return e;
+        const path = apply(editable.path);
+        editable.keyframes[editable.index] = { offset, path };
+        return { ...e, keyframes: editable.keyframes };
+      }, shouldRecord);
+      if (!finish) frontDragRecorded.current = true;
+      else frontDragRecorded.current = false;
     },
     [frontDraft, patchFront, selectedEventId]
   );
@@ -477,6 +565,7 @@ export default function Studio({ projectId, initial }: { projectId: string; init
     setSelectedEventId(id);
     setFrontDraft(null);
     setFrontHandle(null);
+    setFrontControl(null);
     if (id) {
       setSelectedNationId(null);
       setPropsTab("event");
@@ -486,36 +575,54 @@ export default function Studio({ projectId, initial }: { projectId: string; init
     }
   }, []);
 
-  const onFrontInsertHandle = useCallback(
-    (index: number, ll: [number, number]) => {
-      if (frontDraft) {
-        setFrontDraft((d) => {
-          if (!d) return d;
-          const next = d.slice();
-          next.splice(index, 0, ll);
-          return next;
-        });
-        setFrontHandle(index);
-        return;
-      }
+  const onFrontInsertNode = useCallback(
+    (segment: number, t: number) => {
+      const ev = projectRef.current.events.find((e) => e.id === selectedEventId);
+      if (ev?.type !== "front") return;
+      const offset = Math.max(0, Math.round((timeRef.current - ev.start) * 10) / 10);
+      const current = editableFrontKeyframe(ev, offset);
+      if (!current) return;
+      const inserted = splitBezierPathSegment(current.path, segment, t, !!ev.closed);
+      if (inserted.index < 0) return;
+      patchFront(ev.id, (e) => {
+        const editable = editableFrontKeyframe(e, offset);
+        if (!editable) return e;
+        const result = splitBezierPathSegment(editable.path, segment, t, !!e.closed);
+        editable.keyframes[editable.index] = { offset, path: result.path };
+        return { ...e, keyframes: editable.keyframes };
+      });
+      setFrontHandle(inserted.index);
+    },
+    [patchFront, selectedEventId]
+  );
+
+  const onFrontToggleNode = useCallback(
+    (index: number) => {
       const ev = projectRef.current.events.find((e) => e.id === selectedEventId);
       if (ev?.type !== "front") return;
       const offset = Math.max(0, Math.round((timeRef.current - ev.start) * 10) / 10);
       patchFront(ev.id, (e) => {
-        const kfs = cloneKeyframes(e.keyframes);
-        let ki = keyframeAt(kfs, offset);
-        if (ki < 0) {
-          const ni = nearestKeyframeIndex(e.keyframes, offset);
-          const src = ni >= 0 ? e.keyframes[ni].points : e.keyframes[0]?.points ?? [];
-          kfs.push({ offset, points: src.map((p) => [p[0], p[1]] as [number, number]) });
-          ki = kfs.length - 1;
+        const editable = editableFrontKeyframe(e, offset);
+        if (!editable?.path.nodes[index]) return e;
+        const path = cloneBezierPath(editable.path);
+        const node = path.nodes[index];
+        if (node.in || node.out) {
+          node.in = undefined;
+          node.out = undefined;
+          node.linked = false;
+        } else {
+          const prev = path.nodes[e.closed ? (index - 1 + path.nodes.length) % path.nodes.length : Math.max(0, index - 1)].anchor;
+          const next = path.nodes[e.closed ? (index + 1) % path.nodes.length : Math.min(path.nodes.length - 1, index + 1)].anchor;
+          const tangent: [number, number] = [lonDelta(prev[0], next[0]) / 6, (next[1] - prev[1]) / 6];
+          node.in = index === 0 && !e.closed ? undefined : [-tangent[0], -tangent[1]];
+          node.out = index === path.nodes.length - 1 && !e.closed ? undefined : tangent;
+          node.linked = true;
         }
-        kfs[ki].points.splice(index, 0, ll);
-        return { ...e, keyframes: kfs };
+        editable.keyframes[editable.index] = { offset, path };
+        return { ...e, keyframes: editable.keyframes };
       });
-      setFrontHandle(index);
     },
-    [frontDraft, patchFront, selectedEventId]
+    [patchFront, selectedEventId]
   );
 
   const onFrontPickCaptured = useCallback(
@@ -528,52 +635,30 @@ export default function Studio({ projectId, initial }: { projectId: string; init
   );
 
   const onFrontClose = useCallback(() => {
-    if (frontDraft && frontDraft.length >= 3) {
-      const pts = frontDraft.slice();
-      const a = pts[0];
-      if (Math.hypot(a[0] - pts[pts.length - 1][0], a[1] - pts[pts.length - 1][1]) > 0.02) pts.push([a[0], a[1]]);
-      const ev = ensureFrontEvent();
-      const offset = Math.max(0, Math.round((timeRef.current - ev.start) * 10) / 10);
-      patchFront(ev.id, (e) => {
-        const kfs = cloneKeyframes(e.keyframes);
-        const existing = keyframeAt(kfs, offset);
-        const next = { offset, points: pts.map((p) => [p[0], p[1]] as [number, number]) };
-        if (existing >= 0) kfs[existing] = next;
-        else kfs.push(next);
-        return {
-          ...e,
-          keyframes: kfs,
-          closed: true,
-          capturedSide: e.keyframes.length ? e.capturedSide : inferCapturedSide(pts),
-        };
-      });
-      setFrontDraft(null);
-      setFrontHandle(null);
+    if (frontDraft && frontDraft.nodes.length >= 3) {
+      commitFrontPath(frontDraft, true);
       return;
     }
     const ev = projectRef.current.events.find((e) => e.id === selectedEventId);
     if (ev?.type === "front") patchFront(ev.id, (e) => ({ ...e, closed: true }));
-  }, [ensureFrontEvent, frontDraft, patchFront, selectedEventId]);
+  }, [commitFrontPath, frontDraft, patchFront, selectedEventId]);
 
   const setFrontKeyframe = useCallback(() => {
     const ev = projectRef.current.events.find((e) => e.id === selectedEventId);
     if (ev?.type !== "front") return;
-    if (frontDraft && frontDraft.length >= 2) {
+    if (frontDraft && frontDraft.nodes.length >= 2) {
       finishFrontDraft();
       return;
     }
     const offset = Math.max(0, Math.round((timeRef.current - ev.start) * 10) / 10);
     const points = interpolateFront(ev, offset);
     if (!points || points.length < 2) return;
-    const ni = nearestKeyframeIndex(ev.keyframes, offset);
-    const count = ni >= 0 ? Math.max(4, ev.keyframes[ni].points.length) : 12;
-    const step = Math.max(1, Math.floor(points.length / count));
-    const sampled = points.filter((_, i) => i % step === 0).slice(0, count);
-    if (sampled.length < 2) return;
+    const path = editablePathFromPolyline(points, !!ev.closed);
+    if (path.nodes.length < 2) return;
     patchFront(ev.id, (e) => {
       const kfs = cloneKeyframes(e.keyframes);
       const existing = keyframeAt(kfs, offset);
-      const next = { offset, points: sampled.map((p) => [p[0], p[1]] as [number, number]) };
+      const next = { offset, path };
       if (existing >= 0) kfs[existing] = next;
       else kfs.push(next);
       return { ...e, keyframes: kfs };
@@ -612,9 +697,14 @@ export default function Studio({ projectId, initial }: { projectId: string; init
         e.preventDefault();
         setPlaying((p) => !p);
       } else if (e.key === "Delete" || e.key === "Backspace") {
-        if (tool === "front" && frontDraft && frontDraft.length) {
+        if (tool === "front" && frontDraft?.nodes.length) {
           e.preventDefault();
-          setFrontDraft((d) => (d && d.length ? d.slice(0, -1) : d));
+          setFrontDraft((draft) => {
+            if (!draft?.nodes.length) return draft;
+            const next = cloneBezierPath(draft);
+            next.nodes.pop();
+            return next.nodes.length ? next : null;
+          });
           return;
         }
         if (tool === "front" && frontHandle != null) {
@@ -623,14 +713,16 @@ export default function Studio({ projectId, initial }: { projectId: string; init
             e.preventDefault();
             const hi = frontHandle;
             patchFront(ev.id, (fe) => {
-              const offset = Math.max(0, timeRef.current - fe.start);
-              const kfs = cloneKeyframes(fe.keyframes);
-              const ki = keyframeAt(kfs, offset);
-              if (ki < 0 || !kfs[ki].points[hi] || kfs[ki].points.length <= 2) return fe;
-              kfs[ki].points.splice(hi, 1);
-              return { ...fe, keyframes: kfs };
+              const offset = Math.max(0, Math.round((timeRef.current - fe.start) * 10) / 10);
+              const editable = editableFrontKeyframe(fe, offset);
+              const min = fe.closed ? 3 : 2;
+              if (!editable?.path.nodes[hi] || editable.path.nodes.length <= min) return fe;
+              editable.path.nodes.splice(hi, 1);
+              editable.keyframes[editable.index] = { offset, path: editable.path };
+              return { ...fe, keyframes: editable.keyframes };
             });
             setFrontHandle(null);
+            setFrontControl(null);
             return;
           }
         }
@@ -652,8 +744,18 @@ export default function Studio({ projectId, initial }: { projectId: string; init
       } else if (e.key === "Home") {
         setTime(0);
       } else if (e.key === "Escape") {
+        if (tool === "front" && frontGestureActive.current) {
+          frontGestureActive.current = false;
+          setFrontCancelVersion((v) => v + 1);
+          return;
+        }
         if (frontDraft) {
           setFrontDraft(null);
+          return;
+        }
+        if (frontHandle != null || frontControl) {
+          setFrontHandle(null);
+          setFrontControl(null);
           return;
         }
         setSelection(new Set());
@@ -667,7 +769,7 @@ export default function Studio({ projectId, initial }: { projectId: string; init
     };
     window.addEventListener("keydown", h);
     return () => window.removeEventListener("keydown", h);
-  }, [deleteSelected, duplicateSelected, finishFrontDraft, frontDraft, frontHandle, patchFront, redo, save, selectedEventId, tool, undo]);
+  }, [deleteSelected, duplicateSelected, finishFrontDraft, frontControl, frontDraft, frontHandle, patchFront, redo, save, selectedEventId, tool, undo]);
 
   // ------------------------------------------------------------ layout
   return (
@@ -772,6 +874,17 @@ export default function Studio({ projectId, initial }: { projectId: string; init
                 onSetKeyframe={setKeyframeFromView}
                 frontSelected={selectedEvent?.type === "front"}
                 onSetFrontKeyframe={setFrontKeyframe}
+                frontMode={frontMode}
+                onFrontMode={setFrontMode}
+                frontPrecision={frontPrecision}
+                onFrontPrecision={setFrontPrecision}
+                frontStabilization={frontStabilization}
+                onFrontStabilization={setFrontStabilization}
+                frontClosed={selectedEvent?.type === "front" ? !!selectedEvent.closed : false}
+                onFrontClosed={(closed) => {
+                  const ev = projectRef.current.events.find((event) => event.id === selectedEventId);
+                  if (ev?.type === "front") patchFront(ev.id, (front) => ({ ...front, closed }));
+                }}
                 map={project.map}
                 onUpdateMap={updateMap}
               />
@@ -791,14 +904,27 @@ export default function Studio({ projectId, initial }: { projectId: string; init
                   renderVersion={renderVersion}
                   showHud={showHud}
                   caption={caption}
+                  frontMode={frontMode}
+                  frontStabilization={frontStabilization}
+                  frontTolerance={frontPrecision === "exact" ? 0.5 : frontPrecision === "balanced" ? 1 : 2}
+                  frontCancelVersion={frontCancelVersion}
                   frontEdit={frontEdit}
-                  onFrontAddVertex={onFrontAddVertex}
+                  onFrontCommitPath={commitFrontPath}
+                  onFrontAddPenNode={onFrontAddPenNode}
                   onFrontFinish={finishFrontDraft}
                   onFrontClose={onFrontClose}
-                  onFrontMoveHandle={onFrontMoveHandle}
-                  onFrontInsertHandle={onFrontInsertHandle}
-                  onFrontSelectHandle={setFrontHandle}
+                  onFrontMoveNode={onFrontMoveNode}
+                  onFrontMoveControl={onFrontMoveControl}
+                  onFrontInsertNode={onFrontInsertNode}
+                  onFrontToggleNode={onFrontToggleNode}
+                  onFrontSelectHandle={(index) => {
+                    setFrontHandle(index);
+                    if (index == null) setFrontControl(null);
+                  }}
+                  onFrontSelectControl={setFrontControl}
                   onFrontPickCaptured={onFrontPickCaptured}
+                  onFrontGestureChange={onFrontGestureChange}
+                  onFrontGestureCancel={onFrontGestureCancel}
                 />
                 {/* Basemap progress lives in the status bar; only the failure
                     case needs to interrupt, because the stage stays empty. */}
@@ -835,6 +961,13 @@ export default function Studio({ projectId, initial }: { projectId: string; init
                   onSelectionChange={setSelection}
                   onAssignSelection={assignSelection}
                   onSelectNation={selectNation}
+                  onFrontRedraw={() => {
+                    setTool("front");
+                    setFrontMode("freehand");
+                    setFrontDraft(null);
+                    setFrontHandle(null);
+                    setFrontControl(null);
+                  }}
                 />
               </aside>
             )}

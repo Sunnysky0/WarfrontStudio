@@ -19,7 +19,8 @@ import type {
   StudioEvent,
   TerritoryEvent,
 } from "@/lib/studio/types";
-import { cloneKeyframes, interpolateFront, keyframeAt } from "@/lib/studio/frontline";
+import { cloneKeyframes, interpolateFront, keyframeAt, keyframePointCount, keyframePolyline } from "@/lib/studio/frontline";
+import { pathHasSelfIntersection, polylineToLinearBezierPath, reverseBezierPath } from "@/lib/studio/front-path";
 import { resolveState } from "@/lib/studio/state";
 import { EVENT_TYPE_LABELS } from "@/lib/studio/types";
 import { EventIcon } from "./eventStyle";
@@ -70,6 +71,7 @@ export interface InspectorProps {
   onSelectionChange: (s: Set<string>) => void;
   onAssignSelection: (nationId: string, mode: FrontMode, duration: number) => void;
   onSelectNation: (id: string | null) => void;
+  onFrontRedraw?: () => void;
 }
 
 const EASINGS: { value: Easing; label: string }[] = [
@@ -314,9 +316,7 @@ function SelectionBlock(props: InspectorProps) {
   const [assignNation, setAssignNation] = useState(project.nations[0]?.id ?? "");
   const [assignMode, setAssignMode] = useState<FrontMode>("auto");
   const [assignDur, setAssignDur] = useState(3);
-  useEffect(() => {
-    if (!project.nations.find((n) => n.id === assignNation)) setAssignNation(project.nations[0]?.id ?? "");
-  }, [project.nations, assignNation]);
+  const effectiveAssignNation = project.nations.some((nation) => nation.id === assignNation) ? assignNation : project.nations[0]?.id ?? "";
 
   return (
     <div className="shrink-0 border-b border-wf-line bg-wf-lane/50 px-2.5 py-2.5">
@@ -353,13 +353,13 @@ function SelectionBlock(props: InspectorProps) {
       <Card accent>
         <div className="mb-1.5 text-wf-md font-semibold text-wf-accent-text">Transfer at playhead</div>
         <div className="grid grid-cols-2 gap-1.5">
-          <NationSelect project={project} value={assignNation} onChange={setAssignNation} />
+          <NationSelect project={project} value={effectiveAssignNation} onChange={setAssignNation} />
           <Select value={assignMode} onChange={setAssignMode} options={MODES} />
           <div className="flex items-center gap-1">
             <NumberInput value={assignDur} min={0} step={0.5} onChange={setAssignDur} />
             <span className="text-wf-sm text-wf-text-4">s</span>
           </div>
-          <Button variant="accent" disabled={!assignNation} onClick={() => props.onAssignSelection(assignNation, assignMode, assignDur)}>
+          <Button variant="accent" disabled={!effectiveAssignNation} onClick={() => props.onAssignSelection(effectiveAssignNation, assignMode, assignDur)}>
             Create event
           </Button>
         </div>
@@ -383,6 +383,10 @@ function SelectionBlock(props: InspectorProps) {
 function EventEditor(props: InspectorProps & { ev: StudioEvent }) {
   const { project, basemap, ev, onUpdateEvent, onPick, selection } = props;
   const up = <T extends StudioEvent>(patch: Partial<T>) => onUpdateEvent(ev.id, patch as Partial<StudioEvent>);
+  const frontOffset = ev.type === "front" ? Math.max(0, Math.round((props.time - ev.start) * 10) / 10) : 0;
+  const frontKeyframeIndex = ev.type === "front" ? keyframeAt(ev.keyframes, frontOffset) : -1;
+  const frontKeyframe = ev.type === "front" && frontKeyframeIndex >= 0 ? ev.keyframes[frontKeyframeIndex] : null;
+  const frontSelfIntersects = ev.type === "front" && frontKeyframe ? pathHasSelfIntersection(keyframePolyline(frontKeyframe, !!ev.closed), !!ev.closed) : false;
 
   return (
     <>
@@ -469,7 +473,7 @@ function EventEditor(props: InspectorProps & { ev: StudioEvent }) {
         <>
           <Section title="Drawn frontline">
             <p className="text-wf-sm leading-snug text-wf-text-4">
-              Click the map to place vertices. Double-click or Enter finishes a keyframe at the playhead. Fill is clipped to land, and to occupier and defender when a defender is set — otherwise a local pad around the line, so a landing does not paint a continent.
+              Draw continuously with Freehand, construct exact curves with Pen, or refine anchors and handles in Edit mode. Fill is clipped to land and the selected theater.
             </p>
             <Field label="Occupier">
               <NationSelect project={project} value={ev.nation} onChange={(v) => up<FrontEvent>({ nation: v })} />
@@ -523,6 +527,44 @@ function EventEditor(props: InspectorProps & { ev: StudioEvent }) {
             <Toggle checked={ev.showFrontline !== false} onChange={(v) => up<FrontEvent>({ showFrontline: v })} label="Draw glowing frontline" />
             <Toggle checked={!!ev.closed} onChange={(v) => up<FrontEvent>({ closed: v })} label="Closed ring (pocket / landing)" />
             <Toggle checked={ev.holdAfterEnd !== false} onChange={(v) => up<FrontEvent>({ holdAfterEnd: v })} label="Hold last shape after the clip ends" />
+            <div className="grid grid-cols-2 gap-1.5">
+              <Button size="xs" onClick={props.onFrontRedraw}>Redraw keyframe</Button>
+              <Button
+                size="xs"
+                disabled={!frontKeyframe?.points?.length || !!frontKeyframe.path}
+                onClick={() => {
+                  if (!frontKeyframe?.points?.length) return;
+                  const keyframes = cloneKeyframes(ev.keyframes);
+                  keyframes[frontKeyframeIndex] = {
+                    offset: frontKeyframe.offset,
+                    path: polylineToLinearBezierPath(keyframePolyline(frontKeyframe, !!ev.closed), !!ev.closed),
+                  };
+                  up<FrontEvent>({ keyframes });
+                }}
+              >
+                Convert legacy path
+              </Button>
+              <Button
+                size="xs"
+                disabled={!frontKeyframe?.path}
+                onClick={() => {
+                  if (!frontKeyframe?.path) return;
+                  const keyframes = cloneKeyframes(ev.keyframes);
+                  keyframes[frontKeyframeIndex] = { offset: frontKeyframe.offset, path: reverseBezierPath(frontKeyframe.path) };
+                  up<FrontEvent>({ keyframes });
+                }}
+              >
+                Reverse direction
+              </Button>
+              <div className="flex items-center justify-center rounded-wf-sm border border-wf-line-soft bg-wf-lane px-2 text-wf-sm text-wf-text-4">
+                {frontKeyframe ? `${frontKeyframe.path ? "Bezier" : "Legacy"} · ${keyframePointCount(frontKeyframe)} nodes` : "Interpolated preview"}
+              </div>
+            </div>
+            {frontSelfIntersects && (
+              <p className="rounded-wf-sm border border-wf-warn/35 bg-wf-warn/10 px-2 py-1.5 text-wf-sm text-wf-warn">
+                This path crosses itself. The stroke is valid, but occupied-side fill may contain multiple islands.
+              </p>
+            )}
           </Section>
           <Section title="Keyframes" right={<Badge>{ev.keyframes.length}</Badge>}>
             <Button
@@ -534,8 +576,8 @@ function EventEditor(props: InspectorProps & { ev: StudioEvent }) {
                 const points = interpolateFront(ev, offset);
                 if (!points || points.length < 2) return;
                 const kfs = cloneKeyframes(ev.keyframes);
-                const sampled = points.filter((_, i) => i % Math.max(1, Math.floor(points.length / 12)) === 0).slice(0, 16);
-                const next = { offset, points: sampled.map((p) => [p[0], p[1]] as [number, number]) };
+                const sampled = points.filter((_, i) => i % Math.max(1, Math.floor(points.length / 96)) === 0).slice(0, 128);
+                const next = { offset, path: polylineToLinearBezierPath(sampled, !!ev.closed) };
                 const existing = keyframeAt(kfs, offset);
                 if (existing >= 0) kfs[existing] = next;
                 else kfs.push(next);
@@ -552,7 +594,7 @@ function EventEditor(props: InspectorProps & { ev: StudioEvent }) {
                 .map((kf, i) => (
                   <div key={`${kf.offset}-${i}`} className="flex items-center gap-1.5 text-wf-sm">
                     <span className="tnum w-12 text-wf-text-3">{kf.offset.toFixed(1)}s</span>
-                    <span className="min-w-0 flex-1 truncate text-wf-text-4">{kf.points.length} pts</span>
+                    <span className="min-w-0 flex-1 truncate text-wf-text-4">{kf.path ? "Bezier" : "Legacy"} · {keyframePointCount(kf)} nodes</span>
                     <IconButton
                       title="Delete keyframe"
                       size="sm"

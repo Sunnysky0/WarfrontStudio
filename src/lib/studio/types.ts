@@ -96,6 +96,22 @@ export type Easing = "linear" | "easeInOut" | "easeOut" | "easeIn";
 
 export type FrontMode = "auto" | "radial" | "linear" | "fade" | "instant" | "sweep-from-attacker";
 
+export type LonLat = [number, number];
+
+export interface FrontBezierNode {
+  anchor: LonLat;
+  /** Handle vectors relative to anchor, in longitude/latitude degrees. */
+  in?: LonLat;
+  out?: LonLat;
+  /** Linked handles stay collinear while either side is dragged. */
+  linked?: boolean;
+}
+
+export interface FrontBezierPath {
+  kind: "bezier";
+  nodes: FrontBezierNode[];
+}
+
 interface BaseEvent {
   id: string;
   start: number;
@@ -129,8 +145,10 @@ export interface TerritoryEvent extends BaseEvent {
 export interface FrontKeyframe {
   /** Seconds from event.start. First keyframe should be 0. */
   offset: number;
-  /** Open or closed polyline, coordinates [lon, lat]. */
-  points: [number, number][];
+  /** Legacy control polyline. Its existing Catmull-Rom playback is preserved. */
+  points?: LonLat[];
+  /** Editable vector path. When present this takes precedence over `points`. */
+  path?: FrontBezierPath;
 }
 
 export type FrontTheater = "land" | "sides" | "regions";

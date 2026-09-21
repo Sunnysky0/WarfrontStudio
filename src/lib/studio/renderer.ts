@@ -4,9 +4,10 @@ import type { Basemap } from "./basemap";
 import { mergeRegions, resolveRegionKey, cullGeometry, type GeoBBox } from "./basemap";
 import { createProjection, applyCamera, isAzimuthal, scaleToZoom } from "./projections";
 import { resolveState, type ResolvedState, type ActiveTransfer, type ActiveFront, type NationState, mixColor, withAlpha, clamp, ease } from "./state";
-import type { Camera, MapTheme, ProjectDoc, InsetEvent } from "./types";
+import type { Camera, FrontBezierPath, MapTheme, ProjectDoc, InsetEvent } from "./types";
 import { drawFlag, drawMarker, ringNoise, noise1 } from "./drawing";
-import { capturedFillRing, polylineScreenBBox, type Pt } from "./frontline";
+import { capturedFillRing, distPointToSegment, polylineScreenBBox, projectVisibleSegments, type Pt } from "./frontline";
+import { flattenBezierPath } from "./front-path";
 import { getTheme } from "./themes";
 
 type Ctx = CanvasRenderingContext2D;
@@ -14,8 +15,12 @@ type Ctx = CanvasRenderingContext2D;
 export interface FrontEditOverlay {
   handles: [number, number][];
   line?: [number, number][];
+  path?: FrontBezierPath;
+  /** Canvas-space draft, used to display a freehand stroke without round-tripping projection. */
+  screenLine?: [number, number][];
   closed?: boolean;
   selectedHandle?: number | null;
+  selectedControl?: { index: number; side: "in" | "out" } | null;
   capturedSide?: [number, number] | null;
   draft?: boolean;
   /** Empty-map click sets captured-side instead of starting a new draft. */
@@ -143,6 +148,10 @@ export class MapRenderer {
     this.main.key = "";
     this.inset.reset();
     this.inset.key = "";
+  }
+
+  setOnNeedsRedraw(callback: (() => void) | null) {
+    this.onNeedsRedraw = callback;
   }
 
   resolveKey = (k: string): string => resolveRegionKey(this.basemap, k);
@@ -634,15 +643,38 @@ export class MapRenderer {
   }
 
   // ------------------------------------------------------------------ drawn fronts
-  private projectFront(vp: Viewport, camera: Camera, pts: [number, number][]): Pt[] {
-    const out: Pt[] = [];
-    if (!vp.proj) return out;
-    for (const [lon, lat] of pts) {
-      if (!this.visible(vp, camera, lon, lat)) continue;
-      const s = vp.proj([lon, lat]);
-      if (s && Number.isFinite(s[0]) && Number.isFinite(s[1])) out.push([s[0], s[1]]);
+  private projectFront(vp: Viewport, camera: Camera, pts: [number, number][], closed: boolean, W: number, H: number) {
+    if (!vp.proj) return { segments: [] as Pt[][], allVisible: false };
+    const maxJump = Math.max(W, H) * 0.75;
+    return projectVisibleSegments(
+      pts,
+      ([lon, lat]) => {
+        if (!this.visible(vp, camera, lon, lat)) return null;
+        const point = vp.proj?.([lon, lat]);
+        return point && Number.isFinite(point[0]) && Number.isFinite(point[1]) ? [point[0], point[1]] : null;
+      },
+      closed,
+      maxJump
+    );
+  }
+
+  private mainFrontSegment(segments: Pt[][], captured: Pt | null): Pt[] {
+    const usable = segments.filter((segment) => segment.length >= 2);
+    if (!usable.length) return [];
+    if (!captured) {
+      return usable.reduce((best, segment) => (segment.length > best.length ? segment : best), usable[0]);
     }
-    return out;
+    let best = usable[0];
+    let bestDistance = Infinity;
+    for (const segment of usable) {
+      let distance = Infinity;
+      for (let i = 1; i < segment.length; i++) distance = Math.min(distance, distPointToSegment(captured, segment[i - 1], segment[i]).dist);
+      if (distance < bestDistance) {
+        best = segment;
+        bestDistance = distance;
+      }
+    }
+    return best;
   }
 
   private roughenLine(pts: Pt[], roughness: number, seed: number, k: number, closed: boolean): Pt[] {
@@ -711,9 +743,12 @@ export class MapRenderer {
     phase: "fill" | "stroke"
   ) {
     const th = this.theme;
-    let line = this.projectFront(vp, camera, fr.points);
-    if (line.length < 2) return;
-    line = this.roughenLine(line, fr.roughness, fr.seed, k, fr.closed);
+    const projected = this.projectFront(vp, camera, fr.points, fr.closed, W, H);
+    const segments = projected.segments
+      .filter((segment) => segment.length >= 2)
+      .map((segment, index) => this.roughenLine(segment, fr.roughness, fr.seed + index * 997, k, fr.closed && projected.allVisible));
+    if (!segments.length) return;
+    const allPoints = segments.flat();
     const theater = this.frontTheaterPath(vp, fr, fills);
     const ns = state.nations.get(fr.nation);
     const color = ns ? (th.fillDesaturate ? mixColor(ns.color, th.land, th.fillDesaturate) : ns.color) : th.land;
@@ -723,7 +758,7 @@ export class MapRenderer {
     if (theater) ctx.clip(theater);
     else if (fr.theater === "land") {
       const pad = Math.max(120 * k, 0.12 * Math.min(W, H));
-      const bb = polylineScreenBBox(line, pad);
+      const bb = polylineScreenBBox(allPoints, pad);
       if (bb) {
         const box = new Path2D();
         box.rect(bb.x0, bb.y0, bb.x1 - bb.x0, bb.y1 - bb.y0);
@@ -732,20 +767,23 @@ export class MapRenderer {
     }
 
     if (phase === "fill" && fr.fillOccupation) {
-      const cap = vp.proj ? vp.proj(fr.capturedSide) : null;
-      const captured: Pt =
-        cap && Number.isFinite(cap[0]) && Number.isFinite(cap[1])
-          ? [cap[0], cap[1]]
-          : [line[Math.floor(line.length / 2)][0], line[Math.floor(line.length / 2)][1]];
+      const cap = vp.proj && this.visible(vp, camera, fr.capturedSide[0], fr.capturedSide[1]) ? vp.proj(fr.capturedSide) : null;
+      const captured: Pt | null = cap && Number.isFinite(cap[0]) && Number.isFinite(cap[1]) ? [cap[0], cap[1]] : null;
+      const line = this.mainFrontSegment(segments, captured);
+      if (line.length < 2) {
+        ctx.restore();
+        return;
+      }
+      const fillPoint = captured ?? line[Math.floor(line.length / 2)];
       const pad = Math.max(W, H);
-      const ring = capturedFillRing(line, captured, { x0: -pad, y0: -pad, x1: W + pad, y1: H + pad }, fr.closed);
+      const ring = capturedFillRing(line, fillPoint, { x0: -pad, y0: -pad, x1: W + pad, y1: H + pad }, fr.closed && projected.allVisible);
       if (ring && ring.length >= 3) {
         const path = new Path2D();
         path.moveTo(ring[0][0], ring[0][1]);
         for (let i = 1; i < ring.length; i++) path.lineTo(ring[i][0], ring[i][1]);
         path.closePath();
         ctx.fillStyle = color;
-        ctx.fill(path);
+        ctx.fill(path, "evenodd");
       }
     }
 
@@ -757,9 +795,11 @@ export class MapRenderer {
       ctx.shadowColor = th.frontlineGlow ?? th.frontline;
       ctx.shadowBlur = 14 * k;
       ctx.beginPath();
-      ctx.moveTo(line[0][0], line[0][1]);
-      for (let i = 1; i < line.length; i++) ctx.lineTo(line[i][0], line[i][1]);
-      if (fr.closed) ctx.closePath();
+      for (const line of segments) {
+        ctx.moveTo(line[0][0], line[0][1]);
+        for (let i = 1; i < line.length; i++) ctx.lineTo(line[i][0], line[i][1]);
+        if (fr.closed && projected.allVisible) ctx.closePath();
+      }
       ctx.stroke();
       ctx.shadowBlur = 0;
     }
@@ -768,23 +808,58 @@ export class MapRenderer {
 
   private renderFrontEdit(ctx: Ctx, vp: Viewport, camera: Camera, W: number, H: number, k: number, edit: FrontEditOverlay) {
     const th = this.theme;
-    const line = edit.line?.length ? this.projectFront(vp, camera, edit.line) : this.projectFront(vp, camera, edit.handles);
+    const geoLine = edit.path?.nodes.length ? flattenBezierPath(edit.path, !!edit.closed) : edit.line?.length ? edit.line : edit.handles;
+    const projected = edit.screenLine?.length
+      ? { segments: [edit.screenLine], allVisible: true }
+      : this.projectFront(vp, camera, geoLine, !!edit.closed, W, H);
     ctx.save();
-    if (line.length >= 2) {
+    if (projected.segments.some((line) => line.length >= 2)) {
       ctx.strokeStyle = edit.draft ? th.hudAccent : "#ffffff";
       ctx.globalAlpha = 0.85;
       ctx.lineWidth = 1.6 * k;
       ctx.setLineDash(edit.draft ? [6 * k, 4 * k] : []);
       ctx.beginPath();
-      ctx.moveTo(line[0][0], line[0][1]);
-      for (let i = 1; i < line.length; i++) ctx.lineTo(line[i][0], line[i][1]);
-      if (edit.closed) ctx.closePath();
+      for (const line of projected.segments) {
+        if (line.length < 2) continue;
+        ctx.moveTo(line[0][0], line[0][1]);
+        for (let i = 1; i < line.length; i++) ctx.lineTo(line[i][0], line[i][1]);
+        if (edit.closed && projected.allVisible) ctx.closePath();
+      }
       ctx.stroke();
       ctx.setLineDash([]);
       ctx.globalAlpha = 1;
     }
     const r = Math.max(4, 5.5 * k);
-    edit.handles.forEach((h, i) => {
+    const nodes = edit.path?.nodes;
+    if (nodes && edit.selectedHandle != null) {
+      const node = nodes[edit.selectedHandle];
+      if (node) {
+        const anchor = this.toScreen(vp, camera, node.anchor[0], node.anchor[1], W, H, 40);
+        for (const side of ["in", "out"] as const) {
+          const vector = node[side];
+          if (!vector || !anchor) continue;
+          const hp = this.toScreen(vp, camera, node.anchor[0] + vector[0], node.anchor[1] + vector[1], W, H, 40);
+          if (!hp) continue;
+          ctx.strokeStyle = th.hudAccent;
+          ctx.globalAlpha = 0.7;
+          ctx.lineWidth = 1;
+          ctx.beginPath();
+          ctx.moveTo(anchor[0], anchor[1]);
+          ctx.lineTo(hp[0], hp[1]);
+          ctx.stroke();
+          ctx.globalAlpha = 1;
+          ctx.beginPath();
+          ctx.arc(hp[0], hp[1], Math.max(3, 4 * k), 0, Math.PI * 2);
+          const selected = edit.selectedControl?.index === edit.selectedHandle && edit.selectedControl.side === side;
+          ctx.fillStyle = selected ? th.hudAccent : "#141814";
+          ctx.fill();
+          ctx.strokeStyle = selected ? "#fff" : th.hudAccent;
+          ctx.stroke();
+        }
+      }
+    }
+    const anchors = nodes?.map((node) => node.anchor) ?? edit.handles;
+    anchors.forEach((h, i) => {
       const p = this.toScreen(vp, camera, h[0], h[1], W, H, 40);
       if (!p) return;
       ctx.beginPath();

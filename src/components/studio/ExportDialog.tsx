@@ -1,5 +1,5 @@
 "use client";
-import React, { useEffect, useRef, useState } from "react";
+import React, { useEffect, useRef, useState, useSyncExternalStore } from "react";
 import { AlertTriangle, CheckCircle2, Download, Image as ImageIcon, X } from "lucide-react";
 import type { Basemap } from "@/lib/studio/basemap";
 import { MapRenderer } from "@/lib/studio/renderer";
@@ -19,8 +19,7 @@ export default function ExportDialog({ project, basemap, time, onClose }: { proj
   const [error, setError] = useState<string | null>(null);
   const [result, setResult] = useState<{ url: string; filename: string; size: number; method: string } | null>(null);
   const abort = useRef<AbortController | null>(null);
-  const [wc, setWc] = useState(true);
-  useEffect(() => setWc(webCodecsAvailable()), []);
+  const wc = useSyncExternalStore(() => () => {}, webCodecsAvailable, () => false);
 
   // Modal behaviour the dialog never had: Escape closes it, and focus starts
   // inside so a keyboard user isn't left tabbing through the studio behind it.

@@ -15,7 +15,7 @@ import type {
   DisintegrateEvent,
   TextEvent,
 } from "./types";
-import { defaultTheater, interpolateFront, isClosedPolyline } from "./frontline";
+import { defaultTheater, interpolateFront, isClosedPolyline, keyframeAnchors, sortedKeyframes } from "./frontline";
 
 // ---------------------------------------------------------------- easing / math
 export function ease(kind: Easing | undefined, x: number): number {
@@ -330,7 +330,8 @@ export function resolveState(
     const local = t >= e.end ? Math.max(0, e.end - e.start) : t - e.start;
     const points = interpolateFront(e, local);
     if (!points || points.length < 2) continue;
-    const closed = isClosedPolyline(e.keyframes[0]?.points ?? points, e.closed);
+    const firstKeyframe = sortedKeyframes(e.keyframes)[0];
+    const closed = isClosedPolyline(firstKeyframe ? keyframeAnchors(firstKeyframe) : points, e.closed);
     fronts.push({
       id: e.id,
       eventId: e.id,

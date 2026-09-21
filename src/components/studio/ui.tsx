@@ -49,17 +49,21 @@ export function NumberInput({
   max?: number;
   className?: string;
 }) {
-  const [text, setText] = React.useState(value === undefined ? "" : String(value));
-  React.useEffect(() => {
-    setText(value === undefined ? "" : String(Number.isInteger(value) ? value : +value.toFixed(3)));
-  }, [value]);
+  const formatted = value === undefined ? "" : String(Number.isInteger(value) ? value : +value.toFixed(3));
+  const [text, setText] = React.useState(formatted);
+  const [editing, setEditing] = React.useState(false);
   return (
     <input
       type="number"
       step={step}
       min={min}
       max={max}
-      value={text}
+      value={editing ? text : formatted}
+      onFocus={() => {
+        setText(formatted);
+        setEditing(true);
+      }}
+      onBlur={() => setEditing(false)}
       onChange={(e) => {
         setText(e.target.value);
         const v = parseFloat(e.target.value);

@@ -1,5 +1,6 @@
-import type { Camera, FlagSpec, FrontTheater, Nation, ProjectDoc, StudioEvent, MarkerKind, FrontMode } from "./types";
+import type { Camera, FlagSpec, FrontKeyframe, FrontTheater, Nation, ProjectDoc, StudioEvent, MarkerKind, FrontMode } from "./types";
 import { defaultMapSettings, findFlagPreset } from "./presets";
+import { polylineToBezierPath } from "./front-path";
 
 const iso = (code: string): FlagSpec => ({ kind: "iso", code });
 
@@ -57,7 +58,7 @@ function front(
   start: number,
   end: number,
   nation: string,
-  keyframes: { offset: number; points: [number, number][] }[],
+  keyframes: FrontKeyframe[],
   o: {
     against?: string;
     capturedSide: [number, number];
@@ -529,10 +530,10 @@ export function greatAsianWarTemplate(): ProjectDoc {
     marker(42, 50, "gas", [91.7, 26.1], { size: 14, color: "#9dff5a", extra: [[80.9, 26.8]] }),
     marker(42.5, 52, "missile", [100.5, 13.75], { size: 13, color: "#ff8a3d", extra: [[139.7, 35.7], [72.9, 19.1]] }),
     front(43.5, 52, "prc", [
-      { offset: 0, points: HIM_F0 },
-      { offset: 4, points: HIM_F1 },
-      { offset: 8.5, points: HIM_F2 },
-    ], { against: "ind", capturedSide: [88.5, 29.4], theater: "sides", holdAfterEnd: false, roughness: 0.55, label: "Strike across the Himalayas" }),
+      { offset: 0, path: polylineToBezierPath(HIM_F0, false) },
+      { offset: 4, path: polylineToBezierPath(HIM_F1, false) },
+      { offset: 8.5, path: polylineToBezierPath(HIM_F2, false) },
+    ], { against: "ind", capturedSide: [88.5, 29.4], theater: "sides", holdAfterEnd: false, roughness: 0, label: "Bezier strike across the Himalayas" }),
     terr(52, 52, IND_NORTH, "prc", { mode: "instant", label: "Northern India occupied" }),
     front(44.5, 52, "prc", [
       { offset: 0, points: VNM_F0 },

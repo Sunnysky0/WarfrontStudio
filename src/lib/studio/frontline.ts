@@ -1,4 +1,5 @@
 import type { Easing, FrontEvent, FrontKeyframe, FrontTheater } from "./types";
+import { cloneBezierPath, flattenBezierPath } from "./front-path";
 
 export type Pt = [number, number];
 export type ScreenRect = { x0: number; y0: number; x1: number; y1: number };
@@ -31,7 +32,24 @@ function ease(kind: Easing | undefined, x: number): number {
 const CLOSED_EPS = 0.04;
 
 export function cloneKeyframes(kfs: FrontKeyframe[]): FrontKeyframe[] {
-  return kfs.map((k) => ({ offset: k.offset, points: k.points.map((p) => [p[0], p[1]] as Pt) }));
+  return kfs.map((k) => ({
+    offset: k.offset,
+    points: k.points?.map((p) => [p[0], p[1]] as Pt),
+    path: k.path ? cloneBezierPath(k.path) : undefined,
+  }));
+}
+
+export function keyframeHasGeometry(kf: FrontKeyframe): boolean {
+  return (kf.path?.nodes.length ?? 0) >= 2 || (kf.points?.length ?? 0) >= 2;
+}
+
+export function keyframeAnchors(kf: FrontKeyframe): Pt[] {
+  if (kf.path?.nodes.length) return kf.path.nodes.map((node) => [node.anchor[0], node.anchor[1]] as Pt);
+  return kf.points?.map((p) => [p[0], p[1]] as Pt) ?? [];
+}
+
+export function keyframePointCount(kf: FrontKeyframe): number {
+  return kf.path?.nodes.length ?? kf.points?.length ?? 0;
 }
 
 export function isClosedPolyline(pts: Pt[], closedFlag?: boolean): boolean {
@@ -141,10 +159,40 @@ export function densify(pts: Pt[], closed: boolean, n = 96): Pt[] {
   return resamplePolyline(smooth, n, closed);
 }
 
-export function interpolatePolylines(a: Pt[], b: Pt[], t: number, closed: boolean): Pt[] {
-  const n = clamp(Math.max(a.length, b.length, 8) * 2, 32, 128);
-  const sa = densify(a, closed, n);
-  const sb = densify(b, closed, n);
+function alignPolylines(a: Pt[], b: Pt[], closed: boolean): [Pt[], Pt[]] {
+  const nextPow2 = (v: number) => Math.pow(2, Math.ceil(Math.log2(Math.max(1, v))));
+  const n = clamp(nextPow2(Math.max(a.length, b.length, 64)), 64, 2048);
+  const sa = resamplePolyline(a, n, closed);
+  let sb = resamplePolyline(b, n, closed);
+  if (closed) {
+    const probe = Math.min(64, n);
+    const step = Math.max(1, Math.floor(n / probe));
+    let best = { reversed: false, shift: 0, cost: Infinity };
+    for (const reversed of [false, true]) {
+      const candidate = reversed ? sb.slice().reverse() : sb;
+      for (let k = 0; k < probe; k++) {
+        const shift = Math.round((k / probe) * n) % n;
+        let cost = 0;
+        for (let i = 0; i < n; i += step) {
+          const q = candidate[(i + shift) % n];
+          const dx = lonDelta(sa[i][0], q[0]);
+          const dy = q[1] - sa[i][1];
+          cost += dx * dx + dy * dy;
+        }
+        if (cost < best.cost) best = { reversed, shift, cost };
+      }
+    }
+    const oriented = best.reversed ? sb.slice().reverse() : sb;
+    sb = oriented.map((_, i) => oriented[(i + best.shift) % n]);
+  } else {
+    const forward = Math.hypot(lonDelta(sa[0][0], sb[0][0]), sa[0][1] - sb[0][1]) + Math.hypot(lonDelta(sa[n - 1][0], sb[n - 1][0]), sa[n - 1][1] - sb[n - 1][1]);
+    const reverse = Math.hypot(lonDelta(sa[0][0], sb[n - 1][0]), sa[0][1] - sb[n - 1][1]) + Math.hypot(lonDelta(sa[n - 1][0], sb[0][0]), sa[n - 1][1] - sb[0][1]);
+    if (reverse < forward) sb.reverse();
+  }
+  return [sa, sb];
+}
+
+function interpolateAligned(sa: Pt[], sb: Pt[], t: number): Pt[] {
   const count = Math.min(sa.length, sb.length);
   const out: Pt[] = [];
   for (let i = 0; i < count; i++) {
@@ -153,30 +201,62 @@ export function interpolatePolylines(a: Pt[], b: Pt[], t: number, closed: boolea
   return out;
 }
 
+export function interpolatePolylines(a: Pt[], b: Pt[], t: number, closed: boolean): Pt[] {
+  const [sa, sb] = alignPolylines(a, b, closed);
+  return interpolateAligned(sa, sb, t);
+}
+
+const alignmentCache = new WeakMap<FrontKeyframe, WeakMap<FrontKeyframe, Map<number, [Pt[], Pt[]]>>>();
+
+function alignedKeyframes(a: FrontKeyframe, b: FrontKeyframe, closed: boolean): [Pt[], Pt[]] {
+  let byNext = alignmentCache.get(a);
+  if (!byNext) {
+    byNext = new WeakMap();
+    alignmentCache.set(a, byNext);
+  }
+  let variants = byNext.get(b);
+  if (!variants) {
+    variants = new Map();
+    byNext.set(b, variants);
+  }
+  const key = closed ? 1 : 0;
+  const cached = variants.get(key);
+  if (cached) return cached;
+  const aligned = alignPolylines(keyframePolyline(a, closed), keyframePolyline(b, closed), closed);
+  variants.set(key, aligned);
+  return aligned;
+}
+
 export function sortedKeyframes(kfs: FrontKeyframe[]): FrontKeyframe[] {
-  return kfs.filter((k) => k.points.length >= 1).slice().sort((a, b) => a.offset - b.offset);
+  return kfs.filter(keyframeHasGeometry).slice().sort((a, b) => a.offset - b.offset);
+}
+
+export function keyframePolyline(kf: FrontKeyframe, closed: boolean): Pt[] {
+  if (kf.path?.nodes.length) return flattenBezierPath(kf.path, closed);
+  return densify(kf.points ?? [], closed);
 }
 
 /** Interpolate a front event at local time `u` (seconds from start). */
 export function interpolateFront(ev: FrontEvent, u: number): Pt[] | null {
-  const closed = isClosedPolyline(ev.keyframes[0]?.points ?? [], ev.closed);
   const kfs = sortedKeyframes(ev.keyframes);
   if (!kfs.length) return null;
+  const closed = isClosedPolyline(keyframeAnchors(kfs[0]), ev.closed);
   const duration = Math.max(0, ev.end - ev.start);
   const lastOff = Math.max(duration, kfs[kfs.length - 1].offset);
   const t = clamp(u, 0, lastOff);
-  if (t <= kfs[0].offset) return densify(kfs[0].points, closed);
+  if (t <= kfs[0].offset) return keyframePolyline(kfs[0], closed);
   for (let i = 0; i < kfs.length - 1; i++) {
     const a = kfs[i];
     const b = kfs[i + 1];
     if (t <= b.offset || i === kfs.length - 2) {
-      if (t >= b.offset && i === kfs.length - 2) return densify(kfs[kfs.length - 1].points, closed);
+      if (t >= b.offset && i === kfs.length - 2) return keyframePolyline(kfs[kfs.length - 1], closed);
       const span = Math.max(1e-6, b.offset - a.offset);
       const p = ease(ev.easing, clamp((t - a.offset) / span, 0, 1));
-      return interpolatePolylines(a.points, b.points, p, closed);
+      const [sa, sb] = alignedKeyframes(a, b, closed);
+      return interpolateAligned(sa, sb, p);
     }
   }
-  return densify(kfs[kfs.length - 1].points, closed);
+  return keyframePolyline(kfs[kfs.length - 1], closed);
 }
 
 export function nearestKeyframeIndex(kfs: FrontKeyframe[], offset: number): number {
@@ -366,4 +446,41 @@ export function polylineScreenBBox(pts: Pt[], pad: number): ScreenRect | null {
     if (y > y1) y1 = y;
   }
   return { x0: x0 - pad, y0: y0 - pad, x1: x1 + pad, y1: y1 + pad };
+}
+
+export function projectVisibleSegments(
+  points: Pt[],
+  project: (point: Pt) => Pt | null,
+  closed: boolean,
+  maxJump = Infinity
+): { segments: Pt[][]; allVisible: boolean } {
+  const segments: Pt[][] = [];
+  let current: Pt[] = [];
+  let visibleCount = 0;
+  const flush = () => {
+    if (current.length) segments.push(current);
+    current = [];
+  };
+  for (const point of points) {
+    const projected = project(point);
+    if (!projected) {
+      flush();
+      continue;
+    }
+    visibleCount++;
+    const previous = current[current.length - 1];
+    if (previous && Math.hypot(projected[0] - previous[0], projected[1] - previous[1]) > maxJump) flush();
+    current.push(projected);
+  }
+  flush();
+  if (closed && visibleCount < points.length && segments.length > 1) {
+    const first = segments[0];
+    const last = segments[segments.length - 1];
+    const join = Math.hypot(first[0][0] - last[last.length - 1][0], first[0][1] - last[last.length - 1][1]);
+    if (join <= maxJump) {
+      segments[0] = [...last, ...first];
+      segments.pop();
+    }
+  }
+  return { segments, allVisible: visibleCount === points.length && segments.length === 1 };
 }
